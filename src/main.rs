@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 const DB_PATH: &str = "elo.redb";
 const KEY_SEP: char = '\x1f';
@@ -137,7 +137,7 @@ impl Graph {
 
 #[derive(Clone)]
 struct AppState {
-    graph: Arc<Mutex<Graph>>,
+    graph: Arc<RwLock<Graph>>,
     db: Arc<Database>,
     api_key: Arc<String>,
 }
@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph = load_graph(db.as_ref())?;
 
     let state = AppState {
-        graph: Arc::new(Mutex::new(graph)),
+        graph: Arc::new(RwLock::new(graph)),
         db,
         api_key: Arc::new(api_key),
     };
@@ -276,12 +276,10 @@ async fn create_node(
     State(state): State<AppState>,
     Json(payload): Json<CreateNode>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut graph = state.graph.lock().await;
-    graph.add_node(&payload.id);
-    drop(graph);
-
     let node_id = payload.id.clone();
     run_db(state.db.clone(), move |db| insert_node(db, &node_id)).await?;
+    let mut graph = state.graph.write().await;
+    graph.add_node(&payload.id);
 
     Ok(StatusCode::CREATED)
 }
@@ -290,16 +288,17 @@ async fn create_edge(
     State(state): State<AppState>,
     Json(payload): Json<CreateEdge>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut graph = state.graph.lock().await;
-    if !graph.has_node(&payload.from) || !graph.has_node(&payload.to) {
-        return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_node(&payload.from) || !graph.has_node(&payload.to) {
+            return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+        }
     }
-    graph.add_edge(&payload.from, &payload.to);
-    drop(graph);
-
     let from = payload.from.clone();
     let to = payload.to.clone();
     run_db(state.db.clone(), move |db| insert_edge(db, &from, &to)).await?;
+    let mut graph = state.graph.write().await;
+    graph.add_edge(&payload.from, &payload.to);
 
     Ok(StatusCode::CREATED)
 }
@@ -309,17 +308,18 @@ async fn set_node_data(
     Path(id): Path<String>,
     Json(payload): Json<KeyValue>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut graph = state.graph.lock().await;
-    if !graph.has_node(&id) {
-        return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_node(&id) {
+            return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+        }
     }
-    graph.set_node_data(&id, &payload.key, &payload.value);
-    drop(graph);
-
     let node_id = id.clone();
     let key = payload.key.clone();
     let value = payload.value.clone();
     run_db(state.db.clone(), move |db| insert_node_data(db, &node_id, &key, &value)).await?;
+    let mut graph = state.graph.write().await;
+    graph.set_node_data(&id, &payload.key, &payload.value);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -328,18 +328,19 @@ async fn set_edge_data(
     State(state): State<AppState>,
     Json(payload): Json<EdgeKeyValue>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut graph = state.graph.lock().await;
-    if !graph.has_edge(&payload.from, &payload.to) {
-        return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_edge(&payload.from, &payload.to) {
+            return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
+        }
     }
-    graph.set_edge_data(&payload.from, &payload.to, &payload.key, &payload.value);
-    drop(graph);
-
     let from = payload.from.clone();
     let to = payload.to.clone();
     let key = payload.key.clone();
     let value = payload.value.clone();
     run_db(state.db.clone(), move |db| insert_edge_data(db, &from, &to, &key, &value)).await?;
+    let mut graph = state.graph.write().await;
+    graph.set_edge_data(&payload.from, &payload.to, &payload.key, &payload.value);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -348,58 +349,22 @@ async fn get_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<NodeView>, (StatusCode, String)> {
-    let graph = state.graph.lock().await;
-    let node = graph
-        .get_node(&id)
-        .ok_or((StatusCode::NOT_FOUND, "node not found".to_string()))?;
+    let node_id = id.clone();
+    let node = run_db(state.db.clone(), move |db| get_node_from_db(db, &node_id)).await?;
+    let node = node.ok_or((StatusCode::NOT_FOUND, "node not found".to_string()))?;
 
-    let edges = node
-        .neighbors
-        .iter()
-        .map(|edge| EdgeView {
-            to: edge.to.clone(),
-            data: edge.data.clone(),
-        })
-        .collect();
-
-    Ok(Json(NodeView {
-        id: node.id.clone(),
-        data: node.data.clone(),
-        edges,
-    }))
+    Ok(Json(node))
 }
 
 async fn list_nodes(
     State(state): State<AppState>,
     Query(query): Query<NodeListQuery>,
-) -> Json<Vec<NodeView>> {
-    let graph = state.graph.lock().await;
-    let mut nodes = Vec::new();
+) -> Result<Json<Vec<NodeView>>, (StatusCode, String)> {
+    let node_type = query.r#type.clone();
+    let nodes = run_db(state.db.clone(), move |db| list_nodes_from_db(db, node_type.as_deref()))
+        .await?;
 
-    for node in graph.nodes.values() {
-        if let Some(ref node_type) = query.r#type {
-            if node.data.get("type") != Some(node_type) {
-                continue;
-            }
-        }
-
-        let edges = node
-            .neighbors
-            .iter()
-            .map(|edge| EdgeView {
-                to: edge.to.clone(),
-                data: edge.data.clone(),
-            })
-            .collect();
-
-        nodes.push(NodeView {
-            id: node.id.clone(),
-            data: node.data.clone(),
-            edges,
-        });
-    }
-
-    Json(nodes)
+    Ok(Json(nodes))
 }
 
 #[derive(Serialize)]
@@ -412,46 +377,23 @@ struct EdgeListView {
 async fn list_edges(
     State(state): State<AppState>,
     Query(query): Query<EdgeListQuery>,
-) -> Json<Vec<EdgeListView>> {
-    let graph = state.graph.lock().await;
-    let mut edges = Vec::new();
+) -> Result<Json<Vec<EdgeListView>>, (StatusCode, String)> {
+    let edge_type = query.r#type.clone();
+    let from = query.from.clone();
+    let to = query.to.clone();
+    let edges = run_db(state.db.clone(), move |db| {
+        list_edges_from_db(db, edge_type.as_deref(), from.as_deref(), to.as_deref())
+    })
+    .await?;
 
-    for node in graph.nodes.values() {
-        if let Some(ref from_filter) = query.from {
-            if &node.id != from_filter {
-                continue;
-            }
-        }
-
-        for edge in &node.neighbors {
-            if let Some(ref to_filter) = query.to {
-                if &edge.to != to_filter {
-                    continue;
-                }
-            }
-
-            if let Some(ref edge_type) = query.r#type {
-                if edge.data.get("type") != Some(edge_type) {
-                    continue;
-                }
-            }
-
-            edges.push(EdgeListView {
-                from: node.id.clone(),
-                to: edge.to.clone(),
-                data: edge.data.clone(),
-            });
-        }
-    }
-
-    Json(edges)
+    Ok(Json(edges))
 }
 
 async fn check_path(
     State(state): State<AppState>,
     Query(query): Query<PathQuery>,
 ) -> Json<PathResponse> {
-    let graph = state.graph.lock().await;
+    let graph = state.graph.read().await;
     Json(PathResponse {
         exists: graph.exist_path(&query.from, &query.to),
     })
@@ -461,7 +403,7 @@ async fn recommend_nodes(
     State(state): State<AppState>,
     Query(query): Query<RecommendQuery>,
 ) -> Result<Json<Vec<Recommendation>>, (StatusCode, String)> {
-    let graph = state.graph.lock().await;
+    let graph = state.graph.read().await;
     let start = graph
         .get_node(&query.start)
         .ok_or((StatusCode::NOT_FOUND, "start node not found".to_string()))?;
@@ -599,6 +541,191 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
     }
 
     Ok(graph)
+}
+
+fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+    if nodes_table.get(node_id)?.is_none() {
+        return Ok(None);
+    }
+
+    let mut data = HashMap::new();
+    let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+    for entry in node_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((id, data_key)) = split_two(key.value()) {
+            if id == node_id {
+                data.insert(data_key, value.value().to_string());
+            }
+        }
+    }
+
+    let mut edges = Vec::new();
+    let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+    for entry in edge_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+            if from_id == node_id {
+                edge_data
+                    .entry(edge_key(&from_id, &to_id))
+                    .or_default()
+                    .insert(data_key, value.value().to_string());
+            }
+        }
+    }
+
+    let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    for entry in edges_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id)) = split_two(key.value()) {
+            if from_id == node_id {
+                let data = edge_data.remove(&edge_key(&from_id, &to_id)).unwrap_or_default();
+                edges.push(EdgeView { to: to_id, data });
+            }
+        }
+    }
+
+    Ok(Some(NodeView {
+        id: node_id.to_string(),
+        data,
+        edges,
+    }))
+}
+
+fn list_nodes_from_db(
+    db: &Database,
+    node_type: Option<&str>,
+) -> Result<Vec<NodeView>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+    let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+    let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+
+    let mut node_data: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for entry in node_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((node_id, data_key)) = split_two(key.value()) {
+            node_data
+                .entry(node_id)
+                .or_default()
+                .insert(data_key, value.value().to_string());
+        }
+    }
+
+    let mut edges_by_from: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in edges_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id)) = split_two(key.value()) {
+            edges_by_from.entry(from_id).or_default().push(to_id);
+        }
+    }
+
+    let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for entry in edge_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+            edge_data
+                .entry(edge_key(&from_id, &to_id))
+                .or_default()
+                .insert(data_key, value.value().to_string());
+        }
+    }
+
+    let mut nodes = Vec::new();
+    for entry in nodes_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let node_id = key.value().to_string();
+        let data = node_data.remove(&node_id).unwrap_or_default();
+        if let Some(node_type) = node_type {
+            if data.get("type").map(|value| value.as_str()) != Some(node_type) {
+                continue;
+            }
+        }
+
+        let mut edges = Vec::new();
+        if let Some(to_list) = edges_by_from.get(&node_id) {
+            for to_id in to_list {
+                let data = edge_data.remove(&edge_key(&node_id, to_id)).unwrap_or_default();
+                edges.push(EdgeView {
+                    to: to_id.clone(),
+                    data,
+                });
+            }
+        }
+
+        nodes.push(NodeView {
+            id: node_id,
+            data,
+            edges,
+        });
+    }
+
+    Ok(nodes)
+}
+
+fn list_edges_from_db(
+    db: &Database,
+    edge_type: Option<&str>,
+    from_filter: Option<&str>,
+    to_filter: Option<&str>,
+) -> Result<Vec<EdgeListView>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+
+    let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for entry in edge_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+            edge_data
+                .entry(edge_key(&from_id, &to_id))
+                .or_default()
+                .insert(data_key, value.value().to_string());
+        }
+    }
+
+    let mut edges = Vec::new();
+    for entry in edges_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id)) = split_two(key.value()) {
+            if let Some(from_filter) = from_filter {
+                if from_id != from_filter {
+                    continue;
+                }
+            }
+            if let Some(to_filter) = to_filter {
+                if to_id != to_filter {
+                    continue;
+                }
+            }
+
+            let data = edge_data
+                .remove(&edge_key(&from_id, &to_id))
+                .unwrap_or_default();
+            if let Some(edge_type) = edge_type {
+                if data.get("type").map(|value| value.as_str()) != Some(edge_type) {
+                    continue;
+                }
+            }
+
+            edges.push(EdgeListView {
+                from: from_id,
+                to: to_id,
+                data,
+            });
+        }
+    }
+
+    Ok(edges)
 }
 
 async fn run_db<T, F>(db: Arc<Database>, operation: F) -> Result<T, (StatusCode, String)>
