@@ -5,8 +5,8 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
+use redb::{Database, ReadOnlyTable, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -17,7 +17,13 @@ use std::{
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-const DB_PATH: &str = "elo.db";
+const DB_PATH: &str = "elo.redb";
+const KEY_SEP: char = '\x1f';
+
+const NODES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("nodes");
+const EDGES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edges");
+const NODE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("node_data");
+const EDGE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_data");
 
 #[derive(Debug)]
 struct Node {
@@ -132,7 +138,7 @@ impl Graph {
 #[derive(Clone)]
 struct AppState {
     graph: Arc<Mutex<Graph>>,
-    db: SqlitePool,
+    db: Arc<Database>,
     api_key: Arc<String>,
 }
 
@@ -219,14 +225,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("ELO_API_KEY").map_err(|_| "ELO_API_KEY not set")?;
     let host = env::var("ELO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("ELO_PORT").unwrap_or_else(|_| "3000".to_string());
-    let db_url = format!("sqlite://./{}?mode=rwc", DB_PATH);
-    let pool = SqlitePool::connect(&db_url).await?;
-    init_db(&pool).await?;
-    let graph = load_graph(&pool).await?;
+    let db = Arc::new(Database::open(DB_PATH).or_else(|_| Database::create(DB_PATH))?);
+    init_db(db.as_ref())?;
+    let graph = load_graph(db.as_ref())?;
 
     let state = AppState {
         graph: Arc::new(Mutex::new(graph)),
-        db: pool,
+        db,
         api_key: Arc::new(api_key),
     };
 
@@ -275,11 +280,8 @@ async fn create_node(
     graph.add_node(&payload.id);
     drop(graph);
 
-    sqlx::query("INSERT OR IGNORE INTO nodes (id) VALUES (?)")
-        .bind(&payload.id)
-        .execute(&state.db)
-        .await
-        .map_err(db_error)?;
+    let node_id = payload.id.clone();
+    run_db(state.db.clone(), move |db| insert_node(db, &node_id)).await?;
 
     Ok(StatusCode::CREATED)
 }
@@ -295,12 +297,9 @@ async fn create_edge(
     graph.add_edge(&payload.from, &payload.to);
     drop(graph);
 
-    sqlx::query("INSERT OR IGNORE INTO edges (from_id, to_id) VALUES (?, ?)")
-        .bind(&payload.from)
-        .bind(&payload.to)
-        .execute(&state.db)
-        .await
-        .map_err(db_error)?;
+    let from = payload.from.clone();
+    let to = payload.to.clone();
+    run_db(state.db.clone(), move |db| insert_edge(db, &from, &to)).await?;
 
     Ok(StatusCode::CREATED)
 }
@@ -317,16 +316,10 @@ async fn set_node_data(
     graph.set_node_data(&id, &payload.key, &payload.value);
     drop(graph);
 
-    sqlx::query(
-        "INSERT INTO node_data (node_id, key, value) VALUES (?, ?, ?) \
-        ON CONFLICT(node_id, key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(&id)
-    .bind(&payload.key)
-    .bind(&payload.value)
-    .execute(&state.db)
-    .await
-    .map_err(db_error)?;
+    let node_id = id.clone();
+    let key = payload.key.clone();
+    let value = payload.value.clone();
+    run_db(state.db.clone(), move |db| insert_node_data(db, &node_id, &key, &value)).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -342,17 +335,11 @@ async fn set_edge_data(
     graph.set_edge_data(&payload.from, &payload.to, &payload.key, &payload.value);
     drop(graph);
 
-    sqlx::query(
-        "INSERT INTO edge_data (from_id, to_id, key, value) VALUES (?, ?, ?, ?) \
-        ON CONFLICT(from_id, to_id, key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(&payload.from)
-    .bind(&payload.to)
-    .bind(&payload.key)
-    .bind(&payload.value)
-    .execute(&state.db)
-    .await
-    .map_err(db_error)?;
+    let from = payload.from.clone();
+    let to = payload.to.clone();
+    let key = payload.key.clone();
+    let value = payload.value.clone();
+    run_db(state.db.clone(), move |db| insert_edge_data(db, &from, &to, &key, &value)).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -565,101 +552,147 @@ fn edge_weight(edge: &Edge) -> f64 {
         .unwrap_or(1.0)
 }
 
-async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(pool)
-        .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS nodes (\
-            id TEXT PRIMARY KEY\
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS node_data (\
-            node_id TEXT NOT NULL,\
-            key TEXT NOT NULL,\
-            value TEXT NOT NULL,\
-            PRIMARY KEY (node_id, key),\
-            FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE\
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS edges (\
-            from_id TEXT NOT NULL,\
-            to_id TEXT NOT NULL,\
-            PRIMARY KEY (from_id, to_id),\
-            FOREIGN KEY (from_id) REFERENCES nodes(id) ON DELETE CASCADE,\
-            FOREIGN KEY (to_id) REFERENCES nodes(id) ON DELETE CASCADE\
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS edge_data (\
-            from_id TEXT NOT NULL,\
-            to_id TEXT NOT NULL,\
-            key TEXT NOT NULL,\
-            value TEXT NOT NULL,\
-            PRIMARY KEY (from_id, to_id, key),\
-            FOREIGN KEY (from_id, to_id) REFERENCES edges(from_id, to_id) ON DELETE CASCADE\
-        )",
-    )
-    .execute(pool)
-    .await?;
-
+fn init_db(db: &Database) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    write_txn.open_table(NODES_TABLE)?;
+    write_txn.open_table(NODE_DATA_TABLE)?;
+    write_txn.open_table(EDGES_TABLE)?;
+    write_txn.open_table(EDGE_DATA_TABLE)?;
+    write_txn.commit()?;
     Ok(())
 }
 
-async fn load_graph(pool: &SqlitePool) -> Result<Graph, sqlx::Error> {
+fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
     let mut graph = Graph::new();
 
-    let node_rows = sqlx::query("SELECT id FROM nodes").fetch_all(pool).await?;
-    for row in node_rows {
-        let id: String = row.try_get("id")?;
-        graph.add_node(&id);
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+    for entry in nodes_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        graph.add_node(key.value());
     }
 
-    let edge_rows = sqlx::query("SELECT from_id, to_id FROM edges")
-        .fetch_all(pool)
-        .await?;
-    for row in edge_rows {
-        let from_id: String = row.try_get("from_id")?;
-        let to_id: String = row.try_get("to_id")?;
-        graph.add_edge(&from_id, &to_id);
+    let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    for entry in edges_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id)) = split_two(key.value()) {
+            graph.add_edge(&from_id, &to_id);
+        }
     }
 
-    let node_data_rows = sqlx::query("SELECT node_id, key, value FROM node_data")
-        .fetch_all(pool)
-        .await?;
-    for row in node_data_rows {
-        let node_id: String = row.try_get("node_id")?;
-        let key: String = row.try_get("key")?;
-        let value: String = row.try_get("value")?;
-        graph.set_node_data(&node_id, &key, &value);
+    let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+    for entry in node_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((node_id, data_key)) = split_two(key.value()) {
+            graph.set_node_data(&node_id, &data_key, value.value());
+        }
     }
 
-    let edge_data_rows = sqlx::query("SELECT from_id, to_id, key, value FROM edge_data")
-        .fetch_all(pool)
-        .await?;
-    for row in edge_data_rows {
-        let from_id: String = row.try_get("from_id")?;
-        let to_id: String = row.try_get("to_id")?;
-        let key: String = row.try_get("key")?;
-        let value: String = row.try_get("value")?;
-        graph.set_edge_data(&from_id, &to_id, &key, &value);
+    let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+    for entry in edge_data_table.iter()? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+            graph.set_edge_data(&from_id, &to_id, &data_key, value.value());
+        }
     }
 
     Ok(graph)
 }
 
-fn db_error(error: sqlx::Error) -> (StatusCode, String) {
+async fn run_db<T, F>(db: Arc<Database>, operation: F) -> Result<T, (StatusCode, String)>
+where
+    T: Send + 'static,
+    F: FnOnce(&Database) -> Result<T, redb::Error> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(db.as_ref()))
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(db_error)
+}
+
+fn insert_node(db: &Database, node_id: &str) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(NODES_TABLE)?;
+        table.insert(node_id, "")?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+fn insert_edge(db: &Database, from: &str, to: &str) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(EDGES_TABLE)?;
+        let key = edge_key(from, to);
+        table.insert(key.as_str(), "")?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+fn insert_node_data(
+    db: &Database,
+    node_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(NODE_DATA_TABLE)?;
+        let data_key = node_data_key(node_id, key);
+        table.insert(data_key.as_str(), value)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+fn insert_edge_data(
+    db: &Database,
+    from: &str,
+    to: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(EDGE_DATA_TABLE)?;
+        let data_key = edge_data_key(from, to, key);
+        table.insert(data_key.as_str(), value)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+fn edge_key(from: &str, to: &str) -> String {
+    format!("{from}{KEY_SEP}{to}")
+}
+
+fn node_data_key(node_id: &str, key: &str) -> String {
+    format!("{node_id}{KEY_SEP}{key}")
+}
+
+fn edge_data_key(from: &str, to: &str, key: &str) -> String {
+    format!("{from}{KEY_SEP}{to}{KEY_SEP}{key}")
+}
+
+fn split_two(value: &str) -> Option<(String, String)> {
+    let mut parts = value.splitn(2, KEY_SEP);
+    let first = parts.next()?;
+    let second = parts.next()?;
+    Some((first.to_string(), second.to_string()))
+}
+
+fn split_three(value: &str) -> Option<(String, String, String)> {
+    let mut parts = value.splitn(3, KEY_SEP);
+    let first = parts.next()?;
+    let second = parts.next()?;
+    let third = parts.next()?;
+    Some((first.to_string(), second.to_string(), third.to_string()))
+}
+
+fn db_error(error: redb::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
