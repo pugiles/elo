@@ -237,8 +237,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/nodes", post(create_node).get(list_nodes))
-        .route("/nodes/:id", get(get_node))
-        .route("/nodes/:id/data", put(set_node_data))
+        .route("/nodes/{id}", get(get_node))
+        .route("/nodes/{id}/data", put(set_node_data))
         .route("/edges", post(create_edge).put(set_edge_data).get(list_edges))
         .route("/path", get(check_path))
         .route("/recommendations", get(recommend_nodes))
