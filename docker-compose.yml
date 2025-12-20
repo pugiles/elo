@@ -1,0 +1,19 @@
+services:
+  elo:
+    image: elo
+    build:
+      context: .
+    container_name: elo
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      ELO_API_KEY: ${ELO_API_KEY:?set in .env}
+      ELO_HOST: 0.0.0.0
+      ELO_PORT: 3000
+      ELO_DB_PATH: /data/elo.redb
+    volumes:
+      - elo_data:/data
+
+volumes:
+  elo_data:

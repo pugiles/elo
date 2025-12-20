@@ -1,15 +1,15 @@
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     middleware,
     routing::{get, post, put},
-    Json, Router,
 };
 use redb::{Database, ReadOnlyTable, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     net::SocketAddr,
     sync::Arc,
@@ -24,6 +24,8 @@ const NODES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("nodes");
 const EDGES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edges");
 const NODE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("node_data");
 const EDGE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_data");
+const NODE_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("node_index");
+const EDGE_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_index");
 
 #[derive(Debug)]
 struct Node {
@@ -225,8 +227,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("ELO_API_KEY").map_err(|_| "ELO_API_KEY not set")?;
     let host = env::var("ELO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("ELO_PORT").unwrap_or_else(|_| "3000".to_string());
-    let db = Arc::new(Database::open(DB_PATH).or_else(|_| Database::create(DB_PATH))?);
+    let db_path = env::var("ELO_DB_PATH").unwrap_or_else(|_| DB_PATH.to_string());
+    let db =
+        Arc::new(Database::open(db_path.as_str()).or_else(|_| Database::create(db_path.as_str()))?);
     init_db(db.as_ref())?;
+    rebuild_indexes_if_empty(db.as_ref())?;
     let graph = load_graph(db.as_ref())?;
 
     let state = AppState {
@@ -239,7 +244,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/nodes", post(create_node).get(list_nodes))
         .route("/nodes/{id}", get(get_node))
         .route("/nodes/{id}/data", put(set_node_data))
-        .route("/edges", post(create_edge).put(set_edge_data).get(list_edges))
+        .route(
+            "/edges",
+            post(create_edge).put(set_edge_data).get(list_edges),
+        )
         .route("/path", get(check_path))
         .route("/recommendations", get(recommend_nodes))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -317,7 +325,10 @@ async fn set_node_data(
     let node_id = id.clone();
     let key = payload.key.clone();
     let value = payload.value.clone();
-    run_db(state.db.clone(), move |db| insert_node_data(db, &node_id, &key, &value)).await?;
+    run_db(state.db.clone(), move |db| {
+        insert_node_data(db, &node_id, &key, &value)
+    })
+    .await?;
     let mut graph = state.graph.write().await;
     graph.set_node_data(&id, &payload.key, &payload.value);
 
@@ -338,7 +349,10 @@ async fn set_edge_data(
     let to = payload.to.clone();
     let key = payload.key.clone();
     let value = payload.value.clone();
-    run_db(state.db.clone(), move |db| insert_edge_data(db, &from, &to, &key, &value)).await?;
+    run_db(state.db.clone(), move |db| {
+        insert_edge_data(db, &from, &to, &key, &value)
+    })
+    .await?;
     let mut graph = state.graph.write().await;
     graph.set_edge_data(&payload.from, &payload.to, &payload.key, &payload.value);
 
@@ -361,8 +375,10 @@ async fn list_nodes(
     Query(query): Query<NodeListQuery>,
 ) -> Result<Json<Vec<NodeView>>, (StatusCode, String)> {
     let node_type = query.r#type.clone();
-    let nodes = run_db(state.db.clone(), move |db| list_nodes_from_db(db, node_type.as_deref()))
-        .await?;
+    let nodes = run_db(state.db.clone(), move |db| {
+        list_nodes_from_db(db, node_type.as_deref())
+    })
+    .await?;
 
     Ok(Json(nodes))
 }
@@ -500,12 +516,15 @@ fn init_db(db: &Database) -> Result<(), redb::Error> {
     write_txn.open_table(NODE_DATA_TABLE)?;
     write_txn.open_table(EDGES_TABLE)?;
     write_txn.open_table(EDGE_DATA_TABLE)?;
+    write_txn.open_table(NODE_INDEX_TABLE)?;
+    write_txn.open_table(EDGE_INDEX_TABLE)?;
     write_txn.commit()?;
     Ok(())
 }
 
 fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
     let mut graph = Graph::new();
+    let mut decode_cache = LruCache::new(4096);
 
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
 
@@ -513,13 +532,23 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
     let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
     for entry in nodes_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        graph.add_node(key.value());
+        if let Some(node_id) = decode_component_cached(key.value(), &mut decode_cache) {
+            graph.add_node(&node_id);
+        }
     }
 
     let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
     for entry in edges_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id)) = split_two(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
             graph.add_edge(&from_id, &to_id);
         }
     }
@@ -527,7 +556,15 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
     let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
     for entry in node_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((node_id, data_key)) = split_two(key.value()) {
+        if let Some((node_id_encoded, data_key_encoded)) = split_two(key.value()) {
+            let node_id = match decode_component_cached(node_id_encoded, &mut decode_cache) {
+                Some(node_id) => node_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
             graph.set_node_data(&node_id, &data_key, value.value());
         }
     }
@@ -535,7 +572,19 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
     let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
     for entry in edge_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded, data_key_encoded)) = split_three(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
             graph.set_edge_data(&from_id, &to_id, &data_key, value.value());
         }
     }
@@ -546,9 +595,11 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
 fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
 
+    let mut decode_cache = LruCache::new(2048);
     let read_txn = db.begin_read()?;
     let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
-    if nodes_table.get(node_id)?.is_none() {
+    let encoded_node_id = encode_component(node_id);
+    if nodes_table.get(encoded_node_id.as_str())?.is_none() {
         return Ok(None);
     }
 
@@ -556,8 +607,16 @@ fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, re
     let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
     for entry in node_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((id, data_key)) = split_two(key.value()) {
+        if let Some((id_encoded, data_key_encoded)) = split_two(key.value()) {
+            let id = match decode_component_cached(id_encoded, &mut decode_cache) {
+                Some(id) => id,
+                None => continue,
+            };
             if id == node_id {
+                let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                    Some(data_key) => data_key,
+                    None => continue,
+                };
                 data.insert(data_key, value.value().to_string());
             }
         }
@@ -568,8 +627,20 @@ fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, re
     let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
     for entry in edge_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded, data_key_encoded)) = split_three(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
             if from_id == node_id {
+                let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                    Some(to_id) => to_id,
+                    None => continue,
+                };
+                let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                    Some(data_key) => data_key,
+                    None => continue,
+                };
                 edge_data
                     .entry(edge_key(&from_id, &to_id))
                     .or_default()
@@ -581,9 +652,19 @@ fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, re
     let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
     for entry in edges_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id)) = split_two(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
             if from_id == node_id {
-                let data = edge_data.remove(&edge_key(&from_id, &to_id)).unwrap_or_default();
+                let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                    Some(to_id) => to_id,
+                    None => continue,
+                };
+                let data = edge_data
+                    .remove(&edge_key(&from_id, &to_id))
+                    .unwrap_or_default();
                 edges.push(EdgeView { to: to_id, data });
             }
         }
@@ -601,6 +682,55 @@ fn list_nodes_from_db(
     node_type: Option<&str>,
 ) -> Result<Vec<NodeView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+    let mut decode_cache = LruCache::new(4096);
+
+    if let Some(node_type) = node_type {
+        let node_ids = list_node_ids_by_index(db, "type", node_type)?;
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let read_txn = db.begin_read()?;
+        let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+        let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+        let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+        let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+
+        let mut nodes = Vec::new();
+        for node_id in node_ids {
+            let encoded_node_id = encode_component(&node_id);
+            if nodes_table.get(encoded_node_id.as_str())?.is_none() {
+                continue;
+            }
+            let data = load_node_data_for_id(&node_data_table, &node_id)?;
+            let edge_data = load_edge_data_for_from(&edge_data_table, &node_id)?;
+            let mut edges = Vec::new();
+            let prefix = edge_from_prefix(&node_id);
+            for entry in edges_table.range(prefix.as_str()..)? {
+                let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+                let key_value = key.value();
+                if !key_value.starts_with(&prefix) {
+                    break;
+                }
+                if let Some((_, to_id_encoded)) = split_two(key_value) {
+                    let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                        Some(to_id) => to_id,
+                        None => continue,
+                    };
+                    let data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                    edges.push(EdgeView { to: to_id, data });
+                }
+            }
+
+            nodes.push(NodeView {
+                id: node_id,
+                data,
+                edges,
+            });
+        }
+
+        return Ok(nodes);
+    }
 
     let read_txn = db.begin_read()?;
     let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
@@ -611,7 +741,15 @@ fn list_nodes_from_db(
     let mut node_data: HashMap<String, HashMap<String, String>> = HashMap::new();
     for entry in node_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((node_id, data_key)) = split_two(key.value()) {
+        if let Some((node_id_encoded, data_key_encoded)) = split_two(key.value()) {
+            let node_id = match decode_component_cached(node_id_encoded, &mut decode_cache) {
+                Some(node_id) => node_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
             node_data
                 .entry(node_id)
                 .or_default()
@@ -622,7 +760,15 @@ fn list_nodes_from_db(
     let mut edges_by_from: HashMap<String, Vec<String>> = HashMap::new();
     for entry in edges_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id)) = split_two(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
             edges_by_from.entry(from_id).or_default().push(to_id);
         }
     }
@@ -630,7 +776,19 @@ fn list_nodes_from_db(
     let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
     for entry in edge_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded, data_key_encoded)) = split_three(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
             edge_data
                 .entry(edge_key(&from_id, &to_id))
                 .or_default()
@@ -641,7 +799,10 @@ fn list_nodes_from_db(
     let mut nodes = Vec::new();
     for entry in nodes_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        let node_id = key.value().to_string();
+        let node_id = match decode_component_cached(key.value(), &mut decode_cache) {
+            Some(node_id) => node_id,
+            None => continue,
+        };
         let data = node_data.remove(&node_id).unwrap_or_default();
         if let Some(node_type) = node_type {
             if data.get("type").map(|value| value.as_str()) != Some(node_type) {
@@ -652,7 +813,9 @@ fn list_nodes_from_db(
         let mut edges = Vec::new();
         if let Some(to_list) = edges_by_from.get(&node_id) {
             for to_id in to_list {
-                let data = edge_data.remove(&edge_key(&node_id, to_id)).unwrap_or_default();
+                let data = edge_data
+                    .remove(&edge_key(&node_id, to_id))
+                    .unwrap_or_default();
                 edges.push(EdgeView {
                     to: to_id.clone(),
                     data,
@@ -677,15 +840,98 @@ fn list_edges_from_db(
     to_filter: Option<&str>,
 ) -> Result<Vec<EdgeListView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+    let mut decode_cache = LruCache::new(4096);
+
+    if let Some(edge_type) = edge_type {
+        let edges = list_edge_ids_by_index(db, "type", edge_type)?;
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let read_txn = db.begin_read()?;
+        let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+        let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+
+        let mut results = Vec::new();
+        for (from_id, to_id) in edges {
+            if let Some(from_filter) = from_filter {
+                if from_id != from_filter {
+                    continue;
+                }
+            }
+            if let Some(to_filter) = to_filter {
+                if to_id != to_filter {
+                    continue;
+                }
+            }
+            if edges_table
+                .get(edge_key(&from_id, &to_id).as_str())?
+                .is_none()
+            {
+                continue;
+            }
+            let data = load_edge_data_for_edge(&edge_data_table, &from_id, &to_id)?;
+            results.push(EdgeListView {
+                from: from_id,
+                to: to_id,
+                data,
+            });
+        }
+
+        return Ok(results);
+    }
 
     let read_txn = db.begin_read()?;
     let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
     let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
 
+    if let Some(from_filter) = from_filter {
+        let mut results = Vec::new();
+        let edge_data = load_edge_data_for_from(&edge_data_table, from_filter)?;
+        let prefix = edge_from_prefix(from_filter);
+        for entry in edges_table.range(prefix.as_str()..)? {
+            let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+            let key_value = key.value();
+            if !key_value.starts_with(&prefix) {
+                break;
+            }
+            if let Some((_, to_id_encoded)) = split_two(key_value) {
+                let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                    Some(to_id) => to_id,
+                    None => continue,
+                };
+                if let Some(to_filter) = to_filter {
+                    if to_id != to_filter {
+                        continue;
+                    }
+                }
+                let data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                results.push(EdgeListView {
+                    from: from_filter.to_string(),
+                    to: to_id,
+                    data,
+                });
+            }
+        }
+        return Ok(results);
+    }
+
     let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
     for entry in edge_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id, data_key)) = split_three(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded, data_key_encoded)) = split_three(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
             edge_data
                 .entry(edge_key(&from_id, &to_id))
                 .or_default()
@@ -696,7 +942,15 @@ fn list_edges_from_db(
     let mut edges = Vec::new();
     for entry in edges_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id, to_id)) = split_two(key.value()) {
+        if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
             if let Some(from_filter) = from_filter {
                 if from_id != from_filter {
                     continue;
@@ -743,7 +997,8 @@ fn insert_node(db: &Database, node_id: &str) -> Result<(), redb::Error> {
     let write_txn = db.begin_write()?;
     {
         let mut table = write_txn.open_table(NODES_TABLE)?;
-        table.insert(node_id, "")?;
+        let encoded_node_id = encode_component(node_id);
+        table.insert(encoded_node_id.as_str(), "")?;
     }
     write_txn.commit()?;
     Ok(())
@@ -770,7 +1025,18 @@ fn insert_node_data(
     {
         let mut table = write_txn.open_table(NODE_DATA_TABLE)?;
         let data_key = node_data_key(node_id, key);
+        let previous = table
+            .get(data_key.as_str())?
+            .map(|value| value.value().to_string());
         table.insert(data_key.as_str(), value)?;
+        drop(table);
+        let mut index_table = write_txn.open_table(NODE_INDEX_TABLE)?;
+        if let Some(previous) = previous {
+            let previous_key = node_index_key(key, &previous, node_id);
+            index_table.remove(previous_key.as_str())?;
+        }
+        let index_key = node_index_key(key, value, node_id);
+        index_table.insert(index_key.as_str(), "")?;
     }
     write_txn.commit()?;
     Ok(())
@@ -787,39 +1053,504 @@ fn insert_edge_data(
     {
         let mut table = write_txn.open_table(EDGE_DATA_TABLE)?;
         let data_key = edge_data_key(from, to, key);
+        let previous = table
+            .get(data_key.as_str())?
+            .map(|value| value.value().to_string());
         table.insert(data_key.as_str(), value)?;
+        drop(table);
+        let mut index_table = write_txn.open_table(EDGE_INDEX_TABLE)?;
+        if let Some(previous) = previous {
+            let previous_key = edge_index_key(key, &previous, from, to);
+            index_table.remove(previous_key.as_str())?;
+        }
+        let index_key = edge_index_key(key, value, from, to);
+        index_table.insert(index_key.as_str(), "")?;
     }
     write_txn.commit()?;
     Ok(())
 }
 
 fn edge_key(from: &str, to: &str) -> String {
-    format!("{from}{KEY_SEP}{to}")
+    format!(
+        "{}{KEY_SEP}{}",
+        encode_component(from),
+        encode_component(to)
+    )
+}
+
+fn node_index_key(key: &str, value: &str, node_id: &str) -> String {
+    format!(
+        "{}{KEY_SEP}{}{KEY_SEP}{}",
+        encode_component(key),
+        encode_component(value),
+        encode_component(node_id)
+    )
+}
+
+fn edge_index_key(key: &str, value: &str, from: &str, to: &str) -> String {
+    format!(
+        "{}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
+        encode_component(key),
+        encode_component(value),
+        encode_component(from),
+        encode_component(to)
+    )
 }
 
 fn node_data_key(node_id: &str, key: &str) -> String {
-    format!("{node_id}{KEY_SEP}{key}")
+    format!(
+        "{}{KEY_SEP}{}",
+        encode_component(node_id),
+        encode_component(key)
+    )
 }
 
 fn edge_data_key(from: &str, to: &str, key: &str) -> String {
-    format!("{from}{KEY_SEP}{to}{KEY_SEP}{key}")
+    format!(
+        "{}{KEY_SEP}{}{KEY_SEP}{}",
+        encode_component(from),
+        encode_component(to),
+        encode_component(key)
+    )
 }
 
-fn split_two(value: &str) -> Option<(String, String)> {
+fn node_data_prefix(node_id: &str) -> String {
+    format!("{}{}", encode_component(node_id), KEY_SEP)
+}
+
+fn edge_from_prefix(from: &str) -> String {
+    format!("{}{}", encode_component(from), KEY_SEP)
+}
+
+fn edge_data_prefix(from: &str, to: &str) -> String {
+    format!(
+        "{}{KEY_SEP}{}{KEY_SEP}",
+        encode_component(from),
+        encode_component(to)
+    )
+}
+
+fn index_prefix(key: &str, value: &str) -> String {
+    format!(
+        "{}{KEY_SEP}{}{KEY_SEP}",
+        encode_component(key),
+        encode_component(value)
+    )
+}
+
+fn split_two(value: &str) -> Option<(&str, &str)> {
     let mut parts = value.splitn(2, KEY_SEP);
     let first = parts.next()?;
     let second = parts.next()?;
-    Some((first.to_string(), second.to_string()))
+    Some((first, second))
 }
 
-fn split_three(value: &str) -> Option<(String, String, String)> {
+fn split_three(value: &str) -> Option<(&str, &str, &str)> {
     let mut parts = value.splitn(3, KEY_SEP);
     let first = parts.next()?;
     let second = parts.next()?;
     let third = parts.next()?;
-    Some((first.to_string(), second.to_string(), third.to_string()))
+    Some((first, second, third))
+}
+
+fn split_four(value: &str) -> Option<(&str, &str, &str, &str)> {
+    let mut parts = value.splitn(4, KEY_SEP);
+    let first = parts.next()?;
+    let second = parts.next()?;
+    let third = parts.next()?;
+    let fourth = parts.next()?;
+    Some((first, second, third, fourth))
+}
+
+fn split_two_decoded(value: &str) -> Option<(String, String)> {
+    let (first, second) = split_two(value)?;
+    Some((decode_component(first)?, decode_component(second)?))
+}
+
+fn split_three_decoded(value: &str) -> Option<(String, String, String)> {
+    let (first, second, third) = split_three(value)?;
+    Some((
+        decode_component(first)?,
+        decode_component(second)?,
+        decode_component(third)?,
+    ))
+}
+
+#[cfg(test)]
+fn split_four_decoded(value: &str) -> Option<(String, String, String, String)> {
+    let (first, second, third, fourth) = split_four(value)?;
+    Some((
+        decode_component(first)?,
+        decode_component(second)?,
+        decode_component(third)?,
+        decode_component(fourth)?,
+    ))
+}
+
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if *byte == (KEY_SEP as u8) || *byte == b'%' || !byte.is_ascii() {
+            encoded.push('%');
+            encoded.push(nibble_to_hex(byte >> 4));
+            encoded.push(nibble_to_hex(byte & 0x0f));
+        } else {
+            encoded.push(*byte as char);
+        }
+    }
+    encoded
+}
+
+fn decode_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_to_nibble(bytes[index + 1])?;
+            let low = hex_to_nibble(bytes[index + 2])?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => '0',
+    }
+}
+
+fn hex_to_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+struct LruCache {
+    capacity: usize,
+    order: VecDeque<String>,
+    map: HashMap<String, String>,
+}
+
+impl LruCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            order: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<String> {
+        if let Some(value) = self.map.get(key).cloned() {
+            self.touch(key);
+            return Some(value);
+        }
+        None
+    }
+
+    fn insert(&mut self, key: String, value: String) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key.clone(), value);
+            self.touch(&key);
+            return;
+        }
+
+        if self.map.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(position) = self.order.iter().position(|entry| entry == key) {
+            self.order.remove(position);
+            self.order.push_back(key.to_string());
+        }
+    }
+}
+
+fn decode_component_cached(value: &str, cache: &mut LruCache) -> Option<String> {
+    if let Some(cached) = cache.get(value) {
+        return Some(cached);
+    }
+    let decoded = decode_component(value)?;
+    cache.insert(value.to_string(), decoded.clone());
+    Some(decoded)
+}
+
+fn load_node_data_for_id(
+    node_data_table: &ReadOnlyTable<&str, &str>,
+    node_id: &str,
+) -> Result<HashMap<String, String>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let prefix = node_data_prefix(node_id);
+    let mut data = HashMap::new();
+    let mut decode_cache = LruCache::new(1024);
+    for entry in node_data_table.range(prefix.as_str()..)? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let key_value = key.value();
+        if !key_value.starts_with(&prefix) {
+            break;
+        }
+        if let Some((_, data_key_encoded)) = split_two(key_value) {
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
+            data.insert(data_key, value.value().to_string());
+        }
+    }
+    Ok(data)
+}
+
+fn load_edge_data_for_from(
+    edge_data_table: &ReadOnlyTable<&str, &str>,
+    from: &str,
+) -> Result<HashMap<String, HashMap<String, String>>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let prefix = edge_from_prefix(from);
+    let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut decode_cache = LruCache::new(1024);
+    for entry in edge_data_table.range(prefix.as_str()..)? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let key_value = key.value();
+        if !key_value.starts_with(&prefix) {
+            break;
+        }
+        if let Some((_, to_id_encoded, data_key_encoded)) = split_three(key_value) {
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
+            edge_data
+                .entry(to_id)
+                .or_default()
+                .insert(data_key, value.value().to_string());
+        }
+    }
+    Ok(edge_data)
+}
+
+fn load_edge_data_for_edge(
+    edge_data_table: &ReadOnlyTable<&str, &str>,
+    from: &str,
+    to: &str,
+) -> Result<HashMap<String, String>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let prefix = edge_data_prefix(from, to);
+    let mut data = HashMap::new();
+    let mut decode_cache = LruCache::new(512);
+    for entry in edge_data_table.range(prefix.as_str()..)? {
+        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let key_value = key.value();
+        if !key_value.starts_with(&prefix) {
+            break;
+        }
+        if let Some((_, _, data_key_encoded)) = split_three(key_value) {
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
+            data.insert(data_key, value.value().to_string());
+        }
+    }
+    Ok(data)
+}
+
+fn list_node_ids_by_index(
+    db: &Database,
+    key: &str,
+    value: &str,
+) -> Result<Vec<String>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_INDEX_TABLE)?;
+    let prefix = index_prefix(key, value);
+    let mut results = Vec::new();
+    let mut decode_cache = LruCache::new(2048);
+    for entry in index_table.range(prefix.as_str()..)? {
+        let (index_key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let key_value = index_key.value();
+        if !key_value.starts_with(&prefix) {
+            break;
+        }
+        if let Some((_, _, node_id_encoded)) = split_three(key_value) {
+            if let Some(node_id) = decode_component_cached(node_id_encoded, &mut decode_cache) {
+                results.push(node_id);
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn list_edge_ids_by_index(
+    db: &Database,
+    key: &str,
+    value: &str,
+) -> Result<Vec<(String, String)>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_INDEX_TABLE)?;
+    let prefix = index_prefix(key, value);
+    let mut results = Vec::new();
+    let mut decode_cache = LruCache::new(2048);
+    for entry in index_table.range(prefix.as_str()..)? {
+        let (index_key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let key_value = index_key.value();
+        if !key_value.starts_with(&prefix) {
+            break;
+        }
+        if let Some((_, _, from_id_encoded, to_id_encoded)) = split_four(key_value) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            results.push((from_id, to_id));
+        }
+    }
+    Ok(results)
+}
+
+fn rebuild_indexes_if_empty(db: &Database) -> Result<(), redb::Error> {
+    let read_txn = db.begin_read()?;
+    let node_index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_INDEX_TABLE)?;
+    let edge_index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_INDEX_TABLE)?;
+    let node_index_empty = node_index_table.iter()?.next().is_none();
+    let edge_index_empty = edge_index_table.iter()?.next().is_none();
+    drop(read_txn);
+
+    if !node_index_empty && !edge_index_empty {
+        return Ok(());
+    }
+
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+    if node_index_empty {
+        let read_txn = db.begin_read()?;
+        let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+        let mut entries = Vec::new();
+        for entry in node_data_table.iter()? {
+            let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+            if let Some((node_id, data_key)) = split_two_decoded(key.value()) {
+                entries.push(node_index_key(&data_key, value.value(), &node_id));
+            }
+        }
+        drop(read_txn);
+
+        let write_txn = db.begin_write()?;
+        {
+            let mut index_table = write_txn.open_table(NODE_INDEX_TABLE)?;
+            for index_key in entries {
+                index_table.insert(index_key.as_str(), "")?;
+            }
+        }
+        write_txn.commit()?;
+    }
+    if edge_index_empty {
+        let read_txn = db.begin_read()?;
+        let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+        let mut entries = Vec::new();
+        for entry in edge_data_table.iter()? {
+            let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+            if let Some((from_id, to_id, data_key)) = split_three_decoded(key.value()) {
+                entries.push(edge_index_key(&data_key, value.value(), &from_id, &to_id));
+            }
+        }
+        drop(read_txn);
+
+        let write_txn = db.begin_write()?;
+        {
+            let mut index_table = write_txn.open_table(EDGE_INDEX_TABLE)?;
+            for index_key in entries {
+                index_table.insert(index_key.as_str(), "")?;
+            }
+        }
+        write_txn.commit()?;
+    }
+    Ok(())
 }
 
 fn db_error(error: redb::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_decode_roundtrip_with_separators() {
+        let original = "user\x1ftype%admin";
+        let encoded = encode_component(original);
+        let decoded = decode_component(&encoded).expect("decode failed");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn split_two_decoded_restores_components() {
+        let from = "user\x1ftype\x1fadmin";
+        let to = "team%42";
+        let key = edge_key(from, to);
+        let (decoded_from, decoded_to) = split_two_decoded(&key).expect("split_two_decoded failed");
+        assert_eq!(decoded_from, from);
+        assert_eq!(decoded_to, to);
+    }
+
+    #[test]
+    fn split_three_decoded_restores_components() {
+        let from = "user\x1ftype\x1fadmin";
+        let to = "team%42";
+        let data_key = "owner\x1ftype%";
+        let key = edge_data_key(from, to, data_key);
+        let (decoded_from, decoded_to, decoded_key) =
+            split_three_decoded(&key).expect("split_three_decoded failed");
+        assert_eq!(decoded_from, from);
+        assert_eq!(decoded_to, to);
+        assert_eq!(decoded_key, data_key);
+    }
+
+    #[test]
+    fn split_four_decoded_restores_components() {
+        let key = "type\x1fadmin";
+        let value = "yes%true";
+        let from = "user\x1ftype\x1fadmin";
+        let to = "team%42";
+        let index_key = edge_index_key(key, value, from, to);
+        let (decoded_key, decoded_value, decoded_from, decoded_to) =
+            split_four_decoded(&index_key).expect("split_four_decoded failed");
+        assert_eq!(decoded_key, key);
+        assert_eq!(decoded_value, value);
+        assert_eq!(decoded_from, from);
+        assert_eq!(decoded_to, to);
+    }
 }
