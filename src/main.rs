@@ -147,12 +147,14 @@ struct AppState {
 #[derive(Deserialize)]
 struct CreateNode {
     id: String,
+    data: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct CreateEdge {
     from: String,
     to: String,
+    data: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +290,15 @@ async fn create_node(
     run_db(state.db.clone(), move |db| insert_node(db, &node_id)).await?;
     let mut graph = state.graph.write().await;
     graph.add_node(&payload.id);
+    if let Some(data) = payload.data {
+        let node_id = payload.id.clone();
+        let data_clone = data.clone();
+        run_db(state.db.clone(), move |db| insert_node_data_bulk(db, &node_id, &data_clone))
+            .await?;
+        for (key, value) in data {
+            graph.set_node_data(&payload.id, &key, &value);
+        }
+    }
 
     Ok(StatusCode::CREATED)
 }
@@ -307,6 +318,16 @@ async fn create_edge(
     run_db(state.db.clone(), move |db| insert_edge(db, &from, &to)).await?;
     let mut graph = state.graph.write().await;
     graph.add_edge(&payload.from, &payload.to);
+    if let Some(data) = payload.data {
+        let from_id = payload.from.clone();
+        let to_id = payload.to.clone();
+        let data_clone = data.clone();
+        run_db(state.db.clone(), move |db| insert_edge_data_bulk(db, &from_id, &to_id, &data_clone))
+            .await?;
+        for (key, value) in data {
+            graph.set_edge_data(&payload.from, &payload.to, &key, &value);
+        }
+    }
 
     Ok(StatusCode::CREATED)
 }
@@ -1042,6 +1063,33 @@ fn insert_node_data(
     Ok(())
 }
 
+fn insert_node_data_bulk(
+    db: &Database,
+    node_id: &str,
+    data: &HashMap<String, String>,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(NODE_DATA_TABLE)?;
+        let mut index_table = write_txn.open_table(NODE_INDEX_TABLE)?;
+        for (key, value) in data {
+            let data_key = node_data_key(node_id, key);
+            let previous = table
+                .get(data_key.as_str())?
+                .map(|value| value.value().to_string());
+            table.insert(data_key.as_str(), value.as_str())?;
+            if let Some(previous) = previous {
+                let previous_key = node_index_key(key, &previous, node_id);
+                index_table.remove(previous_key.as_str())?;
+            }
+            let index_key = node_index_key(key, value, node_id);
+            index_table.insert(index_key.as_str(), "")?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
 fn insert_edge_data(
     db: &Database,
     from: &str,
@@ -1070,6 +1118,33 @@ fn insert_edge_data(
     Ok(())
 }
 
+fn insert_edge_data_bulk(
+    db: &Database,
+    from: &str,
+    to: &str,
+    data: &HashMap<String, String>,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(EDGE_DATA_TABLE)?;
+        let mut index_table = write_txn.open_table(EDGE_INDEX_TABLE)?;
+        for (key, value) in data {
+            let data_key = edge_data_key(from, to, key);
+            let previous = table
+                .get(data_key.as_str())?
+                .map(|value| value.value().to_string());
+            table.insert(data_key.as_str(), value.as_str())?;
+            if let Some(previous) = previous {
+                let previous_key = edge_index_key(key, &previous, from, to);
+                index_table.remove(previous_key.as_str())?;
+            }
+            let index_key = edge_index_key(key, value, from, to);
+            index_table.insert(index_key.as_str(), "")?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
 fn edge_key(from: &str, to: &str) -> String {
     format!(
         "{}{KEY_SEP}{}",

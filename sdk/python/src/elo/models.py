@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class CreateNode(BaseModel):
     id: str
+    data: Dict[str, str] = Field(default_factory=dict)
 
 
 class EdgeView(BaseModel):
@@ -22,6 +23,14 @@ class Recommendation(BaseModel):
     id: str
     score: float
     data: Dict[str, str]
+
+
+class CreateEdge(BaseModel):
+    from_: str = Field(alias="from")
+    to: str
+    data: Dict[str, str] = Field(default_factory=dict)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class EdgeListResult(BaseModel):

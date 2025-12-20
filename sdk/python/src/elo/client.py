@@ -12,7 +12,7 @@ from .exceptions import (
     ServerError,
     ValidationError,
 )
-from .models import CreateNode, EdgeListResult, NodeView, Recommendation
+from .models import CreateEdge, CreateNode, EdgeListResult, NodeView, Recommendation
 
 
 class EloClient:
@@ -37,12 +37,32 @@ class EloClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def create_node(self, node: CreateNode | str) -> None:
-        payload = node.model_dump() if isinstance(node, CreateNode) else {"id": node}
+    def create_node(
+        self, node: CreateNode | str, data: Optional[Dict[str, str]] = None
+    ) -> None:
+        if isinstance(node, CreateNode):
+            payload = node.model_dump()
+        else:
+            payload = {"id": node}
+            if data:
+                payload["data"] = data
         self._request("POST", "/nodes", json=payload)
 
-    def create_edge(self, from_id: str, to_id: str) -> None:
-        self._request("POST", "/edges", json={"from": from_id, "to": to_id})
+    def create_edge(
+        self,
+        from_id: str | CreateEdge,
+        to_id: Optional[str] = None,
+        data: Optional[Dict[str, str]] = None,
+    ) -> None:
+        if isinstance(from_id, CreateEdge):
+            payload = from_id.model_dump(by_alias=True)
+        else:
+            if to_id is None:
+                raise ValueError("to_id is required when from_id is a string")
+            payload = {"from": from_id, "to": to_id}
+            if data:
+                payload["data"] = data
+        self._request("POST", "/edges", json=payload)
 
     def set_node_data(self, node_id: str, key: str, value: str) -> None:
         self._request(

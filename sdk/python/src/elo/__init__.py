@@ -9,12 +9,20 @@ from .exceptions import (
     ServerError,
     ValidationError,
 )
-from .models import CreateNode, EdgeListResult, EdgeView, NodeView, Recommendation
+from .models import (
+    CreateEdge,
+    CreateNode,
+    EdgeListResult,
+    EdgeView,
+    NodeView,
+    Recommendation,
+)
 
 __all__ = [
     "AuthenticationError",
     "ConnectionError",
     "CreateNode",
+    "CreateEdge",
     "EdgeListResult",
     "EdgeView",
     "EloClient",
