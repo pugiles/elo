@@ -2,3 +2,6 @@
 elo.db
 elo.redb
 /typescript
+__pycache__/
+*.pyc
+.venv/
