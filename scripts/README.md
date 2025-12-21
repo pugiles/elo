@@ -16,6 +16,12 @@ cargo run --release --bin seed
 ELO_API_KEY=seu_token ELO_DB_PATH=elo.redb ELO_HOST=127.0.0.1 ELO_PORT=3000 cargo run --release
 ```
 
+## Smoke test
+
+```sh
+ELO_API_KEY=seu_token bash scripts/run_smoke.sh
+```
+
 ## Load test (k6)
 
 ```sh

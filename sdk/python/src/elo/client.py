@@ -78,6 +78,35 @@ class EloClient:
             json={"from": from_id, "to": to_id, "key": key, "value": value},
         )
 
+    def update_node(
+        self,
+        node_id: str,
+        data: Optional[Dict[str, str]] = None,
+        **kwargs: str,
+    ) -> None:
+        payload = dict(data or {})
+        payload.update(kwargs)
+        if not payload:
+            raise ValueError("update_node requires at least one field")
+        self._request("PATCH", f"/nodes/{node_id}", json={"data": payload})
+
+    def update_edge(
+        self,
+        from_id: str,
+        to_id: str,
+        data: Optional[Dict[str, str]] = None,
+        **kwargs: str,
+    ) -> None:
+        payload = dict(data or {})
+        payload.update(kwargs)
+        if not payload:
+            raise ValueError("update_edge requires at least one field")
+        self._request(
+            "PATCH",
+            "/edges",
+            json={"from": from_id, "to": to_id, "data": payload},
+        )
+
     def get_node(self, node_id: str) -> NodeView:
         response = self._request("GET", f"/nodes/{node_id}")
         return NodeView.model_validate(response.json())
@@ -105,6 +134,22 @@ class EloClient:
         data = response.json()
         return [EdgeListResult.model_validate(item) for item in data]
 
+    def nearby(
+        self,
+        node_type: str,
+        geo_hash_prefix: str,
+        geo_hash_key: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[NodeView]:
+        params: Dict[str, str] = {"type": node_type, "geo_hash_prefix": geo_hash_prefix}
+        if geo_hash_key:
+            params["geo_hash_key"] = geo_hash_key
+        if limit is not None:
+            params["limit"] = str(limit)
+        response = self._request("GET", "/nearby", params=params)
+        data = response.json()
+        return [NodeView.model_validate(item) for item in data]
+
     def path_exists(self, from_id: str, to_id: str) -> bool:
         response = self._request("GET", "/path", params={"from": from_id, "to": to_id})
         return bool(response.json().get("exists"))
@@ -117,6 +162,10 @@ class EloClient:
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
         limit: Optional[int] = None,
+        geo_key: Optional[str] = None,
+        lat: Optional[float] = None,
+        lon: Optional[float] = None,
+        radius_km: Optional[float] = None,
     ) -> List[Recommendation]:
         params: Dict[str, str] = {"start": start, "type": node_type}
         if num_key:
@@ -127,6 +176,14 @@ class EloClient:
             params["max"] = str(max_value)
         if limit is not None:
             params["limit"] = str(limit)
+        if geo_key:
+            params["geo_key"] = geo_key
+        if lat is not None:
+            params["lat"] = str(lat)
+        if lon is not None:
+            params["lon"] = str(lon)
+        if radius_km is not None:
+            params["radius_km"] = str(radius_km)
         response = self._request("GET", "/recommendations", params=params)
         data = response.json()
         return [Recommendation.model_validate(item) for item in data]

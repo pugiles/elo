@@ -1,0 +1,47 @@
+version: "3"
+
+vars:
+  ELO_API_KEY: "{{default \"seu_token\" .ELO_API_KEY}}"
+  ELO_HOST: "{{default \"127.0.0.1\" .ELO_HOST}}"
+  ELO_PORT: "{{default \"3000\" .ELO_PORT}}"
+  ELO_DB_PATH: "{{default \"tmp/elo_taskfile.redb\" .ELO_DB_PATH}}"
+
+tasks:
+  test:
+    desc: "Run Rust + Python integration tests"
+    cmds:
+      - task: test:rust
+      - task: test:python
+
+  test:rust:
+    desc: "Run Rust tests"
+    cmds:
+      - cargo test
+
+  test:rust:nearby:
+    desc: "Run the geohash nearby integration test"
+    cmds:
+      - cargo test --test nearby_geohash
+
+  test:python:
+    desc: "Run Python SDK integration tests"
+    cmds:
+      - uv run pytest -m integration
+    dir: sdk/python
+
+  run:server:
+    desc: "Run the Elo server (debug)"
+    cmds:
+      - mkdir -p tmp
+      - ELO_API_KEY={{.ELO_API_KEY}} ELO_HOST={{.ELO_HOST}} ELO_PORT={{.ELO_PORT}} ELO_DB_PATH={{.ELO_DB_PATH}} cargo run --bin elo
+
+  run:server:release:
+    desc: "Run the Elo server (release)"
+    cmds:
+      - mkdir -p tmp
+      - ELO_API_KEY={{.ELO_API_KEY}} ELO_HOST={{.ELO_HOST}} ELO_PORT={{.ELO_PORT}} ELO_DB_PATH={{.ELO_DB_PATH}} cargo run --release --bin elo
+
+  simulate:lifecycle:
+    desc: "Simulate lifecycle growth against a running server"
+    cmds:
+      - ELO_API_KEY={{.ELO_API_KEY}} ELO_HOST={{.ELO_HOST}} ELO_PORT={{.ELO_PORT}} python3 scripts/simulate_lifecycle.py

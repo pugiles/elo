@@ -17,6 +17,9 @@ from .models import (
     NodeView,
     Recommendation,
 )
+from .orm import Node, NodeMeta
+from .session import setup
+from .types import GeoPoint
 
 __all__ = [
     "AuthenticationError",
@@ -32,4 +35,8 @@ __all__ = [
     "Recommendation",
     "ServerError",
     "ValidationError",
+    "Node",
+    "NodeMeta",
+    "GeoPoint",
+    "setup",
 ]

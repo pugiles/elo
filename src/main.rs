@@ -26,6 +26,7 @@ const NODE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("node_
 const EDGE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_data");
 const NODE_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("node_index");
 const EDGE_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_index");
+const GEO_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("geo_index");
 
 #[derive(Debug)]
 struct Node {
@@ -158,6 +159,18 @@ struct CreateEdge {
 }
 
 #[derive(Deserialize)]
+struct UpdateNodeData {
+    data: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateEdgeData {
+    from: String,
+    to: String,
+    data: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
 struct KeyValue {
     key: String,
     value: String,
@@ -215,6 +228,10 @@ struct RecommendQuery {
     min: Option<f64>,
     max: Option<f64>,
     limit: Option<usize>,
+    geo_key: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius_km: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -222,6 +239,17 @@ struct Recommendation {
     id: String,
     score: f64,
     data: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct NearbyQuery {
+    r#type: String,
+    geo_hash_prefix: Option<String>,
+    geo_hash_key: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius_km: Option<f64>,
+    limit: Option<usize>,
 }
 
 #[tokio::main]
@@ -244,14 +272,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/nodes", post(create_node).get(list_nodes))
-        .route("/nodes/{id}", get(get_node))
+        .route("/nodes/{id}", get(get_node).patch(update_node_data))
         .route("/nodes/{id}/data", put(set_node_data))
         .route(
             "/edges",
-            post(create_edge).put(set_edge_data).get(list_edges),
+            post(create_edge)
+                .put(set_edge_data)
+                .patch(update_edge_data)
+                .get(list_edges),
         )
         .route("/path", get(check_path))
         .route("/recommendations", get(recommend_nodes))
+        .route("/nearby", get(list_nearby))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state);
 
@@ -380,6 +412,58 @@ async fn set_edge_data(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_node_data(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateNodeData>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_node(&id) {
+            return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+        }
+    }
+    let node_id = id.clone();
+    let data_clone = payload.data.clone();
+    run_db(state.db.clone(), move |db| {
+        insert_node_data_bulk(db, &node_id, &data_clone)
+    })
+    .await?;
+    let mut graph = state.graph.write().await;
+    for (key, value) in payload.data {
+        graph.set_node_data(&id, &key, &value);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_edge_data(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateEdgeData>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_edge(&payload.from, &payload.to) {
+            return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
+        }
+    }
+    let from = payload.from.clone();
+    let to = payload.to.clone();
+    let data_clone = payload.data.clone();
+    let from_db = from.clone();
+    let to_db = to.clone();
+    run_db(state.db.clone(), move |db| {
+        insert_edge_data_bulk(db, &from_db, &to_db, &data_clone)
+    })
+    .await?;
+    let mut graph = state.graph.write().await;
+    for (key, value) in payload.data {
+        graph.set_edge_data(&from, &to, &key, &value);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -445,6 +529,22 @@ async fn recommend_nodes(
         .get_node(&query.start)
         .ok_or((StatusCode::NOT_FOUND, "start node not found".to_string()))?;
 
+    let geo_key = query.geo_key.as_deref().unwrap_or("location");
+    let start_point = match (query.lat, query.lon) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        _ => start
+            .data
+            .get(geo_key)
+            .and_then(|value| parse_geo_point(value)),
+    };
+
+    if query.radius_km.is_some() && start_point.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "radius_km requires lat/lon or start node location".to_string(),
+        ));
+    }
+
     let direct_neighbors: HashSet<String> =
         start.neighbors.iter().map(|edge| edge.to.clone()).collect();
 
@@ -502,6 +602,20 @@ async fn recommend_nodes(
             }
         }
 
+        if let (Some(radius_km), Some(origin)) = (query.radius_km, start_point) {
+            let node_point = node
+                .data
+                .get(geo_key)
+                .and_then(|value| parse_geo_point(value));
+            let node_point = match node_point {
+                Some(point) => point,
+                None => continue,
+            };
+            if haversine_km(origin, node_point) > radius_km {
+                continue;
+            }
+        }
+
         results.push(Recommendation {
             id: node.id.clone(),
             score,
@@ -524,11 +638,145 @@ async fn recommend_nodes(
     Ok(Json(results))
 }
 
+async fn list_nearby(
+    State(state): State<AppState>,
+    Query(query): Query<NearbyQuery>,
+) -> Result<Json<Vec<NodeView>>, (StatusCode, String)> {
+    let geo_hash_prefix = if let Some(prefix) = query.geo_hash_prefix.as_deref() {
+        if prefix.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "geo_hash_prefix cannot be empty".to_string(),
+            ));
+        }
+        prefix.to_string()
+    } else {
+        let (lat, lon) = match (query.lat, query.lon) {
+            (Some(lat), Some(lon)) => (lat, lon),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "geo_hash_prefix or lat/lon is required".to_string(),
+                ))
+            }
+        };
+        let radius_km = query.radius_km.unwrap_or(10.0);
+        let precision = geohash_precision_for_km(radius_km);
+        encode_geohash(lat, lon, precision)
+    };
+
+    let geo_hash_key = query
+        .geo_hash_key
+        .clone()
+        .unwrap_or_else(|| "geo_hash".to_string());
+    let node_type = query.r#type.clone();
+    let limit = query.limit;
+
+    let results = run_db(state.db.clone(), move |db| {
+        list_nodes_by_geo_prefix(
+            db,
+            node_type.as_str(),
+            geo_hash_key.as_str(),
+            geo_hash_prefix.as_str(),
+            limit,
+        )
+    })
+    .await?;
+
+    Ok(Json(results))
+}
+
 fn edge_weight(edge: &Edge) -> f64 {
     edge.data
         .get("weight")
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(1.0)
+}
+
+fn parse_geo_point(value: &str) -> Option<(f64, f64)> {
+    let mut parts = value.split(',');
+    let lat = parts.next()?.trim().parse::<f64>().ok()?;
+    let lon = parts.next()?.trim().parse::<f64>().ok()?;
+    if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+fn haversine_km(origin: (f64, f64), point: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (origin.0.to_radians(), origin.1.to_radians());
+    let (lat2, lon2) = (point.0.to_radians(), point.1.to_radians());
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    6371.0 * c
+}
+
+fn geohash_precision_for_km(radius_km: f64) -> usize {
+    if radius_km <= 0.0 {
+        return 9;
+    }
+    let sizes = [
+        (1, 5000.0),
+        (2, 1250.0),
+        (3, 156.0),
+        (4, 39.1),
+        (5, 4.89),
+        (6, 1.22),
+        (7, 0.153),
+        (8, 0.0382),
+        (9, 0.00477),
+    ];
+    for (precision, size_km) in sizes {
+        if size_km >= radius_km {
+            return precision;
+        }
+    }
+    1
+}
+
+fn encode_geohash(lat: f64, lon: f64, precision: usize) -> String {
+    const BASE32: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    let precision = precision.max(1);
+    let mut lat_range = [-90.0, 90.0];
+    let mut lon_range = [-180.0, 180.0];
+    let bits = [16, 8, 4, 2, 1];
+    let mut bit = 0;
+    let mut ch = 0;
+    let mut even = true;
+    let mut geohash = String::with_capacity(precision);
+
+    while geohash.len() < precision {
+        if even {
+            let mid = (lon_range[0] + lon_range[1]) / 2.0;
+            if lon >= mid {
+                ch |= bits[bit];
+                lon_range[0] = mid;
+            } else {
+                lon_range[1] = mid;
+            }
+        } else {
+            let mid = (lat_range[0] + lat_range[1]) / 2.0;
+            if lat >= mid {
+                ch |= bits[bit];
+                lat_range[0] = mid;
+            } else {
+                lat_range[1] = mid;
+            }
+        }
+        even = !even;
+        if bit < 4 {
+            bit += 1;
+        } else {
+            geohash.push(BASE32[ch] as char);
+            bit = 0;
+            ch = 0;
+        }
+    }
+
+    geohash
 }
 
 fn init_db(db: &Database) -> Result<(), redb::Error> {
@@ -539,6 +787,7 @@ fn init_db(db: &Database) -> Result<(), redb::Error> {
     write_txn.open_table(EDGE_DATA_TABLE)?;
     write_txn.open_table(NODE_INDEX_TABLE)?;
     write_txn.open_table(EDGE_INDEX_TABLE)?;
+    write_txn.open_table(GEO_INDEX_TABLE)?;
     write_txn.commit()?;
     Ok(())
 }
@@ -854,6 +1103,71 @@ fn list_nodes_from_db(
     Ok(nodes)
 }
 
+fn list_nodes_by_geo_prefix(
+    db: &Database,
+    node_type: &str,
+    geo_key: &str,
+    geo_prefix: &str,
+    limit: Option<usize>,
+) -> Result<Vec<NodeView>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let node_ids = list_node_ids_by_geo_prefix(db, geo_key, geo_prefix)?;
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let read_txn = db.begin_read()?;
+    let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+    let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+    let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+
+    let mut decode_cache = LruCache::new(4096);
+    let mut nodes = Vec::new();
+    for node_id in node_ids {
+        let encoded_node_id = encode_component(&node_id);
+        if nodes_table.get(encoded_node_id.as_str())?.is_none() {
+            continue;
+        }
+        let data = load_node_data_for_id(&node_data_table, &node_id)?;
+        if data.get("type").map(|value| value.as_str()) != Some(node_type) {
+            continue;
+        }
+        let edge_data = load_edge_data_for_from(&edge_data_table, &node_id)?;
+        let mut edges = Vec::new();
+        let prefix = edge_from_prefix(&node_id);
+        for entry in edges_table.range(prefix.as_str()..)? {
+            let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+            let key_value = key.value();
+            if !key_value.starts_with(&prefix) {
+                break;
+            }
+            if let Some((_, to_id_encoded)) = split_two(key_value) {
+                let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                    Some(to_id) => to_id,
+                    None => continue,
+                };
+                let data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                edges.push(EdgeView { to: to_id, data });
+            }
+        }
+
+        nodes.push(NodeView {
+            id: node_id,
+            data,
+            edges,
+        });
+    }
+
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    if let Some(limit) = limit {
+        nodes.truncate(limit);
+    }
+
+    Ok(nodes)
+}
+
 fn list_edges_from_db(
     db: &Database,
     edge_type: Option<&str>,
@@ -1052,12 +1366,17 @@ fn insert_node_data(
         table.insert(data_key.as_str(), value)?;
         drop(table);
         let mut index_table = write_txn.open_table(NODE_INDEX_TABLE)?;
+        let mut geo_index_table = write_txn.open_table(GEO_INDEX_TABLE)?;
         if let Some(previous) = previous {
             let previous_key = node_index_key(key, &previous, node_id);
             index_table.remove(previous_key.as_str())?;
+            let previous_key = geo_index_key(key, &previous, node_id);
+            geo_index_table.remove(previous_key.as_str())?;
         }
         let index_key = node_index_key(key, value, node_id);
         index_table.insert(index_key.as_str(), "")?;
+        let geo_key = geo_index_key(key, value, node_id);
+        geo_index_table.insert(geo_key.as_str(), "")?;
     }
     write_txn.commit()?;
     Ok(())
@@ -1072,6 +1391,7 @@ fn insert_node_data_bulk(
     {
         let mut table = write_txn.open_table(NODE_DATA_TABLE)?;
         let mut index_table = write_txn.open_table(NODE_INDEX_TABLE)?;
+        let mut geo_index_table = write_txn.open_table(GEO_INDEX_TABLE)?;
         for (key, value) in data {
             let data_key = node_data_key(node_id, key);
             let previous = table
@@ -1081,9 +1401,13 @@ fn insert_node_data_bulk(
             if let Some(previous) = previous {
                 let previous_key = node_index_key(key, &previous, node_id);
                 index_table.remove(previous_key.as_str())?;
+                let previous_key = geo_index_key(key, &previous, node_id);
+                geo_index_table.remove(previous_key.as_str())?;
             }
             let index_key = node_index_key(key, value, node_id);
             index_table.insert(index_key.as_str(), "")?;
+            let geo_key = geo_index_key(key, value, node_id);
+            geo_index_table.insert(geo_key.as_str(), "")?;
         }
     }
     write_txn.commit()?;
@@ -1172,6 +1496,15 @@ fn edge_index_key(key: &str, value: &str, from: &str, to: &str) -> String {
     )
 }
 
+fn geo_index_key(key: &str, value: &str, node_id: &str) -> String {
+    format!(
+        "{}{KEY_SEP}{}{KEY_SEP}{}",
+        encode_component(key),
+        encode_component(value),
+        encode_component(node_id)
+    )
+}
+
 fn node_data_key(node_id: &str, key: &str) -> String {
     format!(
         "{}{KEY_SEP}{}",
@@ -1210,6 +1543,14 @@ fn index_prefix(key: &str, value: &str) -> String {
         "{}{KEY_SEP}{}{KEY_SEP}",
         encode_component(key),
         encode_component(value)
+    )
+}
+
+fn geo_index_prefix(key: &str, prefix: &str) -> String {
+    format!(
+        "{}{KEY_SEP}{}",
+        encode_component(key),
+        encode_component(prefix)
     )
 }
 
@@ -1484,6 +1825,33 @@ fn list_node_ids_by_index(
     Ok(results)
 }
 
+fn list_node_ids_by_geo_prefix(
+    db: &Database,
+    key: &str,
+    prefix_value: &str,
+) -> Result<Vec<String>, redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let read_txn = db.begin_read()?;
+    let index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(GEO_INDEX_TABLE)?;
+    let prefix = geo_index_prefix(key, prefix_value);
+    let mut results = Vec::new();
+    let mut decode_cache = LruCache::new(2048);
+    for entry in index_table.range(prefix.as_str()..)? {
+        let (index_key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let key_value = index_key.value();
+        if !key_value.starts_with(&prefix) {
+            break;
+        }
+        if let Some((_, _, node_id_encoded)) = split_three(key_value) {
+            if let Some(node_id) = decode_component_cached(node_id_encoded, &mut decode_cache) {
+                results.push(node_id);
+            }
+        }
+    }
+    Ok(results)
+}
+
 fn list_edge_ids_by_index(
     db: &Database,
     key: &str,
@@ -1521,11 +1889,13 @@ fn rebuild_indexes_if_empty(db: &Database) -> Result<(), redb::Error> {
     let read_txn = db.begin_read()?;
     let node_index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_INDEX_TABLE)?;
     let edge_index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_INDEX_TABLE)?;
+    let geo_index_table: ReadOnlyTable<&str, &str> = read_txn.open_table(GEO_INDEX_TABLE)?;
     let node_index_empty = node_index_table.iter()?.next().is_none();
     let edge_index_empty = edge_index_table.iter()?.next().is_none();
+    let geo_index_empty = geo_index_table.iter()?.next().is_none();
     drop(read_txn);
 
-    if !node_index_empty && !edge_index_empty {
+    if !node_index_empty && !edge_index_empty && !geo_index_empty {
         return Ok(());
     }
 
@@ -1566,6 +1936,27 @@ fn rebuild_indexes_if_empty(db: &Database) -> Result<(), redb::Error> {
         let write_txn = db.begin_write()?;
         {
             let mut index_table = write_txn.open_table(EDGE_INDEX_TABLE)?;
+            for index_key in entries {
+                index_table.insert(index_key.as_str(), "")?;
+            }
+        }
+        write_txn.commit()?;
+    }
+    if geo_index_empty {
+        let read_txn = db.begin_read()?;
+        let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+        let mut entries = Vec::new();
+        for entry in node_data_table.iter()? {
+            let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
+            if let Some((node_id, data_key)) = split_two_decoded(key.value()) {
+                entries.push(geo_index_key(&data_key, value.value(), &node_id));
+            }
+        }
+        drop(read_txn);
+
+        let write_txn = db.begin_write()?;
+        {
+            let mut index_table = write_txn.open_table(GEO_INDEX_TABLE)?;
             for index_key in entries {
                 index_table.insert(index_key.as_str(), "")?;
             }

@@ -76,6 +76,12 @@ def main():
         {"key": "type", "value": "user"},
     )
     report("PUT /nodes/user:123/data type", status, body, {200, 204})
+    status, body = request(
+        "PATCH",
+        "/nodes/user:123",
+        {"data": {"rating": "850", "status": "active"}},
+    )
+    report("PATCH /nodes/user:123 bulk", status, body, {200, 204})
 
     status, body = request("POST", "/nodes", {"id": "team:42"})
     report("POST /nodes team:42", status, body, {200, 201})
@@ -100,6 +106,16 @@ def main():
         {"from": "user:123", "to": "team:42", "key": "type", "value": "owner"},
     )
     report("PUT /edges user:123->team:42 type", status, body, {200, 204})
+    status, body = request(
+        "PATCH",
+        "/edges",
+        {
+            "from": "user:123",
+            "to": "team:42",
+            "data": {"role": "owner", "since": "2025"},
+        },
+    )
+    report("PATCH /edges user:123->team:42 bulk", status, body, {200, 204})
 
     status, body = request("POST", "/nodes", {"id": "team:99"})
     report("POST /nodes team:99", status, body, {200, 201})

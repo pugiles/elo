@@ -17,6 +17,8 @@
 - `POST /nodes` with `{"id":"user:123"}` then `PUT /nodes/user:123/data` with `{"key":"type","value":"user"}`.
 - `POST /nodes` with `{"id":"team:42"}` then `PUT /nodes/team:42/data` with `{"key":"type","value":"team"}`.
 - `POST /edges` with `{"from":"user:123","to":"team:42"}` then `PUT /edges` with `{"from":"user:123","to":"team:42","key":"type","value":"owner"}`.
+- `PATCH /nodes/user:123` with `{"data":{"rating":"850","status":"active"}}` updates multiple node fields.
+- `PATCH /edges` with `{"from":"user:123","to":"team:42","data":{"role":"owner","since":"2025"}}` updates multiple edge fields.
 - `GET /nodes?type=team` lists all team nodes.
 - `GET /edges?type=owner` lists all owner edges.
 - `GET /recommendations?start=...&type=team&num_key=rating&min=300&max=900&limit=10` returns scored recommendations.
@@ -24,6 +26,10 @@
   `curl -X POST http://127.0.0.1:3000/nodes -H "x-api-key: your_token" -H "content-type: application/json" -d '{"id":"user:123"}'`
 - Curl example (set edge type):
   `curl -X PUT http://127.0.0.1:3000/edges -H "x-api-key: your_token" -H "content-type: application/json" -d '{"from":"user:123","to":"team:42","key":"type","value":"owner"}'`
+- Curl example (bulk update node):
+  `curl -X PATCH http://127.0.0.1:3000/nodes/user:123 -H "x-api-key: your_token" -H "content-type: application/json" -d '{"data":{"rating":"850","status":"active"}}'`
+- Curl example (bulk update edge):
+  `curl -X PATCH http://127.0.0.1:3000/edges -H "x-api-key: your_token" -H "content-type: application/json" -d '{"from":"user:123","to":"team:42","data":{"role":"owner","since":"2025"}}'`
 - Curl example (fetch node):
   `curl http://127.0.0.1:3000/nodes/user:123 -H "x-api-key: your_token"`
 - Curl example (list teams):
