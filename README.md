@@ -21,6 +21,21 @@ curl -X POST http://127.0.0.1:3000/nodes \
   -H "x-api-key: your_token" -H "content-type: application/json" \
   -d '{"id":"user:123"}'
 
+curl -X POST http://127.0.0.1:3000/schema \
+  -H "x-api-key: your_token" -H "content-type: application/json" \
+  -d '{"entity":"node","fields":["type","rating","location","status"]}'
+
+curl -X POST http://127.0.0.1:3000/schema \
+  -H "x-api-key: your_token" -H "content-type: application/json" \
+  -d '{"entity":"edge","fields":["type","weight","status"]}'
+
+python - <<'PY'
+from elo import EloClient
+client = EloClient(base_url="http://127.0.0.1:3000", api_key="your_token")
+client.upsert_schema("node", ["type", "rating", "location", "status"])
+client.upsert_schema("edge", ["type", "weight", "status"])
+PY
+
 curl -X PUT http://127.0.0.1:3000/nodes/user:123/data \
   -H "x-api-key: your_token" -H "content-type: application/json" \
   -d '{"key":"type","value":"user"}'
@@ -37,7 +52,13 @@ curl -X PATCH http://127.0.0.1:3000/edges \
   -H "x-api-key: your_token" -H "content-type: application/json" \
   -d '{"from":"user:123","to":"team:42","data":{"role":"owner","since":"2025"}}'
 
-curl "http://127.0.0.1:3000/recommendations?start=user:123&type=team&radius_km=10" \
+curl "http://127.0.0.1:3000/nodes?type=team&hydrate=false" \
+  -H "x-api-key: your_token"
+
+curl "http://127.0.0.1:3000/edges?type=owner&hydrate=false" \
+  -H "x-api-key: your_token"
+
+curl "http://127.0.0.1:3000/recommendations?start=user:123&type=team&radius_km=10&hydrate=false" \
   -H "x-api-key: your_token"
 
 curl "http://127.0.0.1:3000/nearby?type=Gym&geo_hash_prefix=6gkzwg" \
@@ -55,6 +76,12 @@ See `sdk/python/README.md` for installation and more examples.
 from elo import EloClient
 
 client = EloClient(base_url="http://127.0.0.1:3000", api_key="seu_token")
+client.upsert_schema("node", ["type", "rating", "location", "status"])
+client.upsert_schema("edge", ["type", "weight", "status"])
+
 client.update_node("Joao", email="joao@novo.com", status="active", level="pro")
 client.update_edge("Joao", "Flamengo", since="2025", role="Captain")
+
+node_full = client.get_node("Joao", hydrate=True)
+node_light = client.get_node("Joao", hydrate=False)
 ```

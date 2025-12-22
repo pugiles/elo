@@ -5,6 +5,9 @@ from elo import EloClient
 
 client = EloClient(base_url="http://127.0.0.1:3000", api_key="seu_token")
 
+client.upsert_schema("node", ["type", "rating", "location", "status"])
+client.upsert_schema("edge", ["type", "weight", "status"])
+
 client.create_node("user:123", data={"type": "user"})
 client.create_node("team:42", data={"type": "team", "rating": "520"})
 client.create_edge("user:123", "team:42", data={"type": "owner"})
@@ -15,8 +18,8 @@ client.update_edge("user:123", "team:42", role="captain")
 node = client.get_node("user:123")
 print(node.id, node.data, node.edges)
 
-teams = client.list_nodes(node_type="team")
-edges = client.list_edges(edge_type="owner")
+teams = client.list_nodes(node_type="team", hydrate=False)
+edges = client.list_edges(edge_type="owner", hydrate=False)
 
 recs = client.recommendations(
     start="user:123",
@@ -25,6 +28,7 @@ recs = client.recommendations(
     min_value=300,
     max_value=900,
     limit=5,
+    hydrate=False,
 )
 print(recs)
 
@@ -34,6 +38,7 @@ nearby = client.recommendations(
     start="user:123",
     node_type="team",
     radius_km=10,
+    hydrate=True,
 )
 print(nearby)
 ```
@@ -51,6 +56,7 @@ elo.setup("http://127.0.0.1:3000", "seu_token")
 class User(Node):
     class Meta:
         node_type = "User"
+        schema_fields = ["type", "rating", "location", "status"]
 
     def follow(self, team: "Team") -> None:
         self._client().post(
@@ -74,7 +80,11 @@ class User(Node):
 class Team(Node):
     class Meta:
         node_type = "Team"
+        schema_fields = ["type", "rating", "location", "status"]
 
+
+User.register_schema()
+Team.register_schema()
 
 flamengo = Team(
     id="fla", city="Rio", sport="Futebol", location=GeoPoint(-22.9068, -43.1729)

@@ -11,7 +11,8 @@ from elo.orm import Node
 
 
 def _wait_ready(base_url: str, api_key: str) -> None:
-    for _ in range(50):
+    max_attempts = 200
+    for _ in range(max_attempts):
         try:
             req = urllib.request.Request(
                 f"{base_url}/nodes",

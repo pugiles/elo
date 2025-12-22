@@ -40,6 +40,14 @@
   `curl "http://127.0.0.1:3000/path?from=user:123&to=team:42" -H "x-api-key: your_token"`
 - Curl example (team recommendations):
   `curl "http://127.0.0.1:3000/recommendations?start=user:123&type=team&min=300&limit=5" -H "x-api-key: your_token"`
+- Curl example (schema node):
+  `curl -X POST http://127.0.0.1:3000/schema -H "x-api-key: your_token" -H "content-type: application/json" -d '{"entity":"node","fields":["type","rating","location","status"]}'`
+- Curl example (schema edge):
+  `curl -X POST http://127.0.0.1:3000/schema -H "x-api-key: your_token" -H "content-type: application/json" -d '{"entity":"edge","fields":["type","weight","status"]}'`
+- Curl example (nodes without hydration):
+  `curl "http://127.0.0.1:3000/nodes?type=team&hydrate=false" -H "x-api-key: your_token"`
+- SDK example (schema + hydrate):
+  `python - <<'PY'\nfrom elo import EloClient\nclient = EloClient(base_url="http://127.0.0.1:3000", api_key="your_token")\nclient.upsert_schema("node", ["type", "rating", "location", "status"])\nclient.upsert_schema("edge", ["type", "weight", "status"])\nnode_full = client.get_node("user:123", hydrate=True)\nnode_light = client.get_node("user:123", hydrate=False)\nPY`
 
 ## Coding Style & Naming Conventions
 - Use standard Rust formatting (4-space indentation) and keep code `rustfmt`-clean.

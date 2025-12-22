@@ -107,13 +107,35 @@ class EloClient:
             json={"from": from_id, "to": to_id, "data": payload},
         )
 
-    def get_node(self, node_id: str) -> NodeView:
-        response = self._request("GET", f"/nodes/{node_id}")
+    def upsert_schema(self, entity: str, fields: Iterable[str]) -> None:
+        payload = {"entity": entity, "fields": list(fields)}
+        self._request("POST", "/schema", json=payload)
+
+    def get_schema(self, entity: Optional[str] = None) -> List[Dict[str, Any]]:
+        params = {"entity": entity} if entity else None
+        response = self._request("GET", "/schema", params=params)
+        return response.json()
+
+    def delete_node(self, node_id: str) -> None:
+        self._request("DELETE", f"/nodes/{node_id}")
+
+    def delete_edge(self, from_id: str, to_id: str) -> None:
+        self._request("DELETE", "/edges", params={"from": from_id, "to": to_id})
+
+    def get_node(self, node_id: str, hydrate: Optional[bool] = None) -> NodeView:
+        params = {"hydrate": self._bool_param(hydrate)} if hydrate is not None else None
+        response = self._request("GET", f"/nodes/{node_id}", params=params)
         return NodeView.model_validate(response.json())
 
-    def list_nodes(self, node_type: Optional[str] = None) -> List[NodeView]:
-        params = {"type": node_type} if node_type else None
-        response = self._request("GET", "/nodes", params=params)
+    def list_nodes(
+        self, node_type: Optional[str] = None, hydrate: Optional[bool] = None
+    ) -> List[NodeView]:
+        params: Dict[str, str] = {}
+        if node_type:
+            params["type"] = node_type
+        if hydrate is not None:
+            params["hydrate"] = self._bool_param(hydrate)
+        response = self._request("GET", "/nodes", params=params or None)
         data = response.json()
         return [NodeView.model_validate(item) for item in data]
 
@@ -122,6 +144,7 @@ class EloClient:
         edge_type: Optional[str] = None,
         from_id: Optional[str] = None,
         to_id: Optional[str] = None,
+        hydrate: Optional[bool] = None,
     ) -> List[EdgeListResult]:
         params: Dict[str, str] = {}
         if edge_type:
@@ -130,6 +153,8 @@ class EloClient:
             params["from"] = from_id
         if to_id:
             params["to"] = to_id
+        if hydrate is not None:
+            params["hydrate"] = self._bool_param(hydrate)
         response = self._request("GET", "/edges", params=params or None)
         data = response.json()
         return [EdgeListResult.model_validate(item) for item in data]
@@ -140,12 +165,15 @@ class EloClient:
         geo_hash_prefix: str,
         geo_hash_key: Optional[str] = None,
         limit: Optional[int] = None,
+        hydrate: Optional[bool] = None,
     ) -> List[NodeView]:
         params: Dict[str, str] = {"type": node_type, "geo_hash_prefix": geo_hash_prefix}
         if geo_hash_key:
             params["geo_hash_key"] = geo_hash_key
         if limit is not None:
             params["limit"] = str(limit)
+        if hydrate is not None:
+            params["hydrate"] = self._bool_param(hydrate)
         response = self._request("GET", "/nearby", params=params)
         data = response.json()
         return [NodeView.model_validate(item) for item in data]
@@ -166,6 +194,7 @@ class EloClient:
         lat: Optional[float] = None,
         lon: Optional[float] = None,
         radius_km: Optional[float] = None,
+        hydrate: Optional[bool] = None,
     ) -> List[Recommendation]:
         params: Dict[str, str] = {"start": start, "type": node_type}
         if num_key:
@@ -184,6 +213,8 @@ class EloClient:
             params["lon"] = str(lon)
         if radius_km is not None:
             params["radius_km"] = str(radius_km)
+        if hydrate is not None:
+            params["hydrate"] = self._bool_param(hydrate)
         response = self._request("GET", "/recommendations", params=params)
         data = response.json()
         return [Recommendation.model_validate(item) for item in data]
@@ -219,6 +250,10 @@ class EloClient:
         message = response.text or response.reason_phrase
         self._raise_for_status(response.status_code, message)
         return response
+
+    @staticmethod
+    def _bool_param(value: bool) -> str:
+        return "true" if value else "false"
 
     @staticmethod
     def _raise_for_status(status_code: int, message: str) -> None:

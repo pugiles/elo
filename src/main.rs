@@ -27,6 +27,10 @@ const EDGE_DATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_
 const NODE_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("node_index");
 const EDGE_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("edge_index");
 const GEO_INDEX_TABLE: TableDefinition<&str, &str> = TableDefinition::new("geo_index");
+const SCHEMA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("schema");
+const STATUS_KEY: &str = "status";
+const STATUS_ACTIVE: &str = "active";
+const STATUS_DELETED: &str = "deleted";
 
 #[derive(Debug)]
 struct Node {
@@ -63,6 +67,44 @@ impl Edge {
 #[derive(Debug)]
 struct Graph {
     nodes: HashMap<String, Node>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SchemaCache {
+    node_fields: HashSet<String>,
+    edge_fields: HashSet<String>,
+    node_defined: bool,
+    edge_defined: bool,
+}
+
+impl SchemaCache {
+    fn node_in_memory(&self, key: &str) -> bool {
+        !self.node_defined || self.node_fields.contains(key)
+    }
+
+    fn edge_in_memory(&self, key: &str) -> bool {
+        !self.edge_defined || self.edge_fields.contains(key)
+    }
+
+    fn filter_node_data(&self, data: &HashMap<String, String>) -> HashMap<String, String> {
+        if !self.node_defined {
+            return data.clone();
+        }
+        data.iter()
+            .filter(|(key, _)| self.node_fields.contains(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn filter_edge_data(&self, data: &HashMap<String, String>) -> HashMap<String, String> {
+        if !self.edge_defined {
+            return data.clone();
+        }
+        data.iter()
+            .filter(|(key, _)| self.edge_fields.contains(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
 }
 
 impl Graph {
@@ -114,6 +156,19 @@ impl Graph {
         }
     }
 
+    fn remove_edge(&mut self, from: &str, to: &str) {
+        if let Some(node) = self.nodes.get_mut(from) {
+            node.neighbors.retain(|edge| edge.to != to);
+        }
+    }
+
+    fn remove_node(&mut self, id: &str) {
+        self.nodes.remove(id);
+        for node in self.nodes.values_mut() {
+            node.neighbors.retain(|edge| edge.to != id);
+        }
+    }
+
     fn exist_path(&self, start: &str, end: &str) -> bool {
         let mut visited = HashSet::new();
         self.dfs(start, end, &mut visited)
@@ -143,6 +198,7 @@ struct AppState {
     graph: Arc<RwLock<Graph>>,
     db: Arc<Database>,
     api_key: Arc<String>,
+    schema: Arc<RwLock<SchemaCache>>,
 }
 
 #[derive(Deserialize)]
@@ -206,6 +262,7 @@ struct PathQuery {
 #[derive(Deserialize)]
 struct NodeListQuery {
     r#type: Option<String>,
+    hydrate: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -213,6 +270,29 @@ struct EdgeListQuery {
     r#type: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    hydrate: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct DeleteEdgeQuery {
+    from: String,
+    to: String,
+}
+
+#[derive(Deserialize)]
+struct SchemaPayload {
+    entity: String,
+    fields: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SchemaQuery {
+    entity: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HydrateQuery {
+    hydrate: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -232,6 +312,7 @@ struct RecommendQuery {
     lat: Option<f64>,
     lon: Option<f64>,
     radius_km: Option<f64>,
+    hydrate: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -250,6 +331,7 @@ struct NearbyQuery {
     lon: Option<f64>,
     radius_km: Option<f64>,
     limit: Option<usize>,
+    hydrate: Option<bool>,
 }
 
 #[tokio::main]
@@ -262,25 +344,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(Database::open(db_path.as_str()).or_else(|_| Database::create(db_path.as_str()))?);
     init_db(db.as_ref())?;
     rebuild_indexes_if_empty(db.as_ref())?;
-    let graph = load_graph(db.as_ref())?;
+    ensure_status_defaults(db.as_ref())?;
+    let schema = load_schema(db.as_ref())?;
+    let graph = load_graph(db.as_ref(), &schema)?;
 
     let state = AppState {
         graph: Arc::new(RwLock::new(graph)),
         db,
         api_key: Arc::new(api_key),
+        schema: Arc::new(RwLock::new(schema)),
     };
 
     let app = Router::new()
         .route("/nodes", post(create_node).get(list_nodes))
-        .route("/nodes/{id}", get(get_node).patch(update_node_data))
+        .route(
+            "/nodes/{id}",
+            get(get_node).patch(update_node_data).delete(delete_node),
+        )
         .route("/nodes/{id}/data", put(set_node_data))
         .route(
             "/edges",
             post(create_edge)
                 .put(set_edge_data)
                 .patch(update_edge_data)
-                .get(list_edges),
+                .get(list_edges)
+                .delete(delete_edge),
         )
+        .route("/schema", post(upsert_schema).get(get_schema))
         .route("/path", get(check_path))
         .route("/recommendations", get(recommend_nodes))
         .route("/nearby", get(list_nearby))
@@ -319,15 +409,20 @@ async fn create_node(
     Json(payload): Json<CreateNode>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let node_id = payload.id.clone();
+    let mut data = payload.data.unwrap_or_default();
+    if !data.contains_key(STATUS_KEY) {
+        data.insert(STATUS_KEY.to_string(), STATUS_ACTIVE.to_string());
+    }
     run_db(state.db.clone(), move |db| insert_node(db, &node_id)).await?;
+    let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
     graph.add_node(&payload.id);
-    if let Some(data) = payload.data {
-        let node_id = payload.id.clone();
-        let data_clone = data.clone();
-        run_db(state.db.clone(), move |db| insert_node_data_bulk(db, &node_id, &data_clone))
-            .await?;
-        for (key, value) in data {
+    let node_id = payload.id.clone();
+    let data_clone = data.clone();
+    run_db(state.db.clone(), move |db| insert_node_data_bulk(db, &node_id, &data_clone))
+        .await?;
+    for (key, value) in data {
+        if schema.node_in_memory(&key) {
             graph.set_node_data(&payload.id, &key, &value);
         }
     }
@@ -347,16 +442,21 @@ async fn create_edge(
     }
     let from = payload.from.clone();
     let to = payload.to.clone();
+    let mut data = payload.data.unwrap_or_default();
+    if !data.contains_key(STATUS_KEY) {
+        data.insert(STATUS_KEY.to_string(), STATUS_ACTIVE.to_string());
+    }
     run_db(state.db.clone(), move |db| insert_edge(db, &from, &to)).await?;
+    let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
     graph.add_edge(&payload.from, &payload.to);
-    if let Some(data) = payload.data {
-        let from_id = payload.from.clone();
-        let to_id = payload.to.clone();
-        let data_clone = data.clone();
-        run_db(state.db.clone(), move |db| insert_edge_data_bulk(db, &from_id, &to_id, &data_clone))
-            .await?;
-        for (key, value) in data {
+    let from_id = payload.from.clone();
+    let to_id = payload.to.clone();
+    let data_clone = data.clone();
+    run_db(state.db.clone(), move |db| insert_edge_data_bulk(db, &from_id, &to_id, &data_clone))
+        .await?;
+    for (key, value) in data {
+        if schema.edge_in_memory(&key) {
             graph.set_edge_data(&payload.from, &payload.to, &key, &value);
         }
     }
@@ -382,8 +482,14 @@ async fn set_node_data(
         insert_node_data(db, &node_id, &key, &value)
     })
     .await?;
+    let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
-    graph.set_node_data(&id, &payload.key, &payload.value);
+    if schema.node_in_memory(&payload.key) {
+        graph.set_node_data(&id, &payload.key, &payload.value);
+    }
+    if payload.key == STATUS_KEY && payload.value == STATUS_DELETED {
+        graph.remove_node(&id);
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -406,8 +512,14 @@ async fn set_edge_data(
         insert_edge_data(db, &from, &to, &key, &value)
     })
     .await?;
+    let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
-    graph.set_edge_data(&payload.from, &payload.to, &payload.key, &payload.value);
+    if schema.edge_in_memory(&payload.key) {
+        graph.set_edge_data(&payload.from, &payload.to, &payload.key, &payload.value);
+    }
+    if payload.key == STATUS_KEY && payload.value == STATUS_DELETED {
+        graph.remove_edge(&payload.from, &payload.to);
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -429,9 +541,19 @@ async fn update_node_data(
         insert_node_data_bulk(db, &node_id, &data_clone)
     })
     .await?;
+    let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
+    let mut deleted = false;
     for (key, value) in payload.data {
-        graph.set_node_data(&id, &key, &value);
+        if schema.node_in_memory(&key) {
+            graph.set_node_data(&id, &key, &value);
+        }
+        if key == STATUS_KEY && value == STATUS_DELETED {
+            deleted = true;
+        }
+    }
+    if deleted {
+        graph.remove_node(&id);
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -456,20 +578,168 @@ async fn update_edge_data(
         insert_edge_data_bulk(db, &from_db, &to_db, &data_clone)
     })
     .await?;
+    let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
+    let mut deleted = false;
     for (key, value) in payload.data {
-        graph.set_edge_data(&from, &to, &key, &value);
+        if schema.edge_in_memory(&key) {
+            graph.set_edge_data(&from, &to, &key, &value);
+        }
+        if key == STATUS_KEY && value == STATUS_DELETED {
+            deleted = true;
+        }
+    }
+    if deleted {
+        graph.remove_edge(&from, &to);
     }
 
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn delete_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let node_id = id.clone();
+    let deleted = run_db(state.db.clone(), move |db| soft_delete_node(db, &node_id)).await?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+    }
+    let mut graph = state.graph.write().await;
+    graph.remove_node(&id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_edge(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteEdgeQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let from = query.from.clone();
+    let to = query.to.clone();
+    let deleted = run_db(state.db.clone(), move |db| soft_delete_edge(db, &from, &to)).await?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
+    }
+    let mut graph = state.graph.write().await;
+    graph.remove_edge(&query.from, &query.to);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct SchemaView {
+    entity: String,
+    fields: Vec<String>,
+}
+
+async fn upsert_schema(
+    State(state): State<AppState>,
+    Json(payload): Json<SchemaPayload>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let entity = payload.entity.trim().to_lowercase();
+    if entity != "node" && entity != "edge" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "entity must be node or edge".to_string(),
+        ));
+    }
+
+    let mut fields: Vec<String> = payload
+        .fields
+        .into_iter()
+        .map(|field| field.trim().to_string())
+        .filter(|field| !field.is_empty())
+        .collect();
+    if fields.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "fields must not be empty".to_string(),
+        ));
+    }
+    fields.sort();
+    fields.dedup();
+
+    let fields_clone = fields.clone();
+    let entity_clone = entity.clone();
+    run_db(state.db.clone(), move |db| save_schema(db, &entity_clone, &fields_clone)).await?;
+
+    {
+        let mut schema = state.schema.write().await;
+        if entity == "node" {
+            schema.node_fields = fields.into_iter().collect();
+            schema.node_defined = true;
+        } else {
+            schema.edge_fields = fields.into_iter().collect();
+            schema.edge_defined = true;
+        }
+    }
+
+    let schema_snapshot = state.schema.read().await.clone();
+    let graph = run_db(state.db.clone(), move |db| load_graph(db, &schema_snapshot)).await?;
+    let mut graph_lock = state.graph.write().await;
+    *graph_lock = graph;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_schema(
+    State(state): State<AppState>,
+    Query(query): Query<SchemaQuery>,
+) -> Result<Json<Vec<SchemaView>>, (StatusCode, String)> {
+    let schema = state.schema.read().await;
+    let mut result = Vec::new();
+
+    if let Some(entity) = query.entity.as_deref() {
+        if entity != "node" && entity != "edge" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "entity must be node or edge".to_string(),
+            ));
+        }
+    }
+
+    let want_node = query
+        .entity
+        .as_deref()
+        .map(|value| value == "node")
+        .unwrap_or(true);
+    let want_edge = query
+        .entity
+        .as_deref()
+        .map(|value| value == "edge")
+        .unwrap_or(true);
+
+    if want_node {
+        let mut fields: Vec<String> = schema.node_fields.iter().cloned().collect();
+        fields.sort();
+        result.push(SchemaView {
+            entity: "node".to_string(),
+            fields,
+        });
+    }
+    if want_edge {
+        let mut fields: Vec<String> = schema.edge_fields.iter().cloned().collect();
+        fields.sort();
+        result.push(SchemaView {
+            entity: "edge".to_string(),
+            fields,
+        });
+    }
+
+    Ok(Json(result))
+}
+
 async fn get_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<HydrateQuery>,
 ) -> Result<Json<NodeView>, (StatusCode, String)> {
     let node_id = id.clone();
-    let node = run_db(state.db.clone(), move |db| get_node_from_db(db, &node_id)).await?;
+    let schema = state.schema.read().await.clone();
+    let hydrate = query.hydrate.unwrap_or(true);
+    let node = run_db(state.db.clone(), move |db| {
+        get_node_from_db(db, &node_id, &schema, hydrate)
+    })
+    .await?;
     let node = node.ok_or((StatusCode::NOT_FOUND, "node not found".to_string()))?;
 
     Ok(Json(node))
@@ -480,8 +750,10 @@ async fn list_nodes(
     Query(query): Query<NodeListQuery>,
 ) -> Result<Json<Vec<NodeView>>, (StatusCode, String)> {
     let node_type = query.r#type.clone();
+    let hydrate = query.hydrate.unwrap_or(true);
+    let schema = state.schema.read().await.clone();
     let nodes = run_db(state.db.clone(), move |db| {
-        list_nodes_from_db(db, node_type.as_deref())
+        list_nodes_from_db(db, node_type.as_deref(), &schema, hydrate)
     })
     .await?;
 
@@ -502,8 +774,17 @@ async fn list_edges(
     let edge_type = query.r#type.clone();
     let from = query.from.clone();
     let to = query.to.clone();
+    let hydrate = query.hydrate.unwrap_or(true);
+    let schema = state.schema.read().await.clone();
     let edges = run_db(state.db.clone(), move |db| {
-        list_edges_from_db(db, edge_type.as_deref(), from.as_deref(), to.as_deref())
+        list_edges_from_db(
+            db,
+            edge_type.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            &schema,
+            hydrate,
+        )
     })
     .await?;
 
@@ -524,104 +805,108 @@ async fn recommend_nodes(
     State(state): State<AppState>,
     Query(query): Query<RecommendQuery>,
 ) -> Result<Json<Vec<Recommendation>>, (StatusCode, String)> {
-    let graph = state.graph.read().await;
-    let start = graph
-        .get_node(&query.start)
-        .ok_or((StatusCode::NOT_FOUND, "start node not found".to_string()))?;
+    let mut results = {
+        let graph = state.graph.read().await;
+        let start = graph
+            .get_node(&query.start)
+            .ok_or((StatusCode::NOT_FOUND, "start node not found".to_string()))?;
 
-    let geo_key = query.geo_key.as_deref().unwrap_or("location");
-    let start_point = match (query.lat, query.lon) {
-        (Some(lat), Some(lon)) => Some((lat, lon)),
-        _ => start
-            .data
-            .get(geo_key)
-            .and_then(|value| parse_geo_point(value)),
-    };
-
-    if query.radius_km.is_some() && start_point.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "radius_km requires lat/lon or start node location".to_string(),
-        ));
-    }
-
-    let direct_neighbors: HashSet<String> =
-        start.neighbors.iter().map(|edge| edge.to.clone()).collect();
-
-    let mut scores: HashMap<String, f64> = HashMap::new();
-    for edge in &start.neighbors {
-        let weight1 = edge_weight(edge);
-        if let Some(node) = graph.get_node(&edge.to) {
-            for edge2 in &node.neighbors {
-                let candidate = &edge2.to;
-                if candidate == &query.start {
-                    continue;
-                }
-                if direct_neighbors.contains(candidate) {
-                    continue;
-                }
-
-                let weight2 = edge_weight(edge2);
-                let entry = scores.entry(candidate.clone()).or_insert(0.0);
-                *entry += weight1 * weight2;
-            }
-        }
-    }
-
-    let num_key = query.num_key.as_deref().unwrap_or("rating");
-    let mut results = Vec::new();
-    for (id, score) in scores {
-        let node = match graph.get_node(&id) {
-            Some(node) => node,
-            None => continue,
-        };
-
-        if node.data.get("type").map(|value| value.as_str()) != Some(query.r#type.as_str()) {
-            continue;
-        }
-
-        if query.min.is_some() || query.max.is_some() {
-            let value = node
-                .data
-                .get(num_key)
-                .and_then(|value| value.parse::<f64>().ok());
-            let value = match value {
-                Some(value) => value,
-                None => continue,
-            };
-
-            if let Some(min) = query.min {
-                if value < min {
-                    continue;
-                }
-            }
-            if let Some(max) = query.max {
-                if value > max {
-                    continue;
-                }
-            }
-        }
-
-        if let (Some(radius_km), Some(origin)) = (query.radius_km, start_point) {
-            let node_point = node
+        let geo_key = query.geo_key.as_deref().unwrap_or("location");
+        let start_point = match (query.lat, query.lon) {
+            (Some(lat), Some(lon)) => Some((lat, lon)),
+            _ => start
                 .data
                 .get(geo_key)
-                .and_then(|value| parse_geo_point(value));
-            let node_point = match node_point {
-                Some(point) => point,
-                None => continue,
-            };
-            if haversine_km(origin, node_point) > radius_km {
-                continue;
+                .and_then(|value| parse_geo_point(value)),
+        };
+
+        if query.radius_km.is_some() && start_point.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "radius_km requires lat/lon or start node location".to_string(),
+            ));
+        }
+
+        let direct_neighbors: HashSet<String> =
+            start.neighbors.iter().map(|edge| edge.to.clone()).collect();
+
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        for edge in &start.neighbors {
+            let weight1 = edge_weight(edge);
+            if let Some(node) = graph.get_node(&edge.to) {
+                for edge2 in &node.neighbors {
+                    let candidate = &edge2.to;
+                    if candidate == &query.start {
+                        continue;
+                    }
+                    if direct_neighbors.contains(candidate) {
+                        continue;
+                    }
+
+                    let weight2 = edge_weight(edge2);
+                    let entry = scores.entry(candidate.clone()).or_insert(0.0);
+                    *entry += weight1 * weight2;
+                }
             }
         }
 
-        results.push(Recommendation {
-            id: node.id.clone(),
-            score,
-            data: node.data.clone(),
-        });
-    }
+        let num_key = query.num_key.as_deref().unwrap_or("rating");
+        let mut results = Vec::new();
+        for (id, score) in scores {
+            let node = match graph.get_node(&id) {
+                Some(node) => node,
+                None => continue,
+            };
+
+            if node.data.get("type").map(|value| value.as_str()) != Some(query.r#type.as_str()) {
+                continue;
+            }
+
+            if query.min.is_some() || query.max.is_some() {
+                let value = node
+                    .data
+                    .get(num_key)
+                    .and_then(|value| value.parse::<f64>().ok());
+                let value = match value {
+                    Some(value) => value,
+                    None => continue,
+                };
+
+                if let Some(min) = query.min {
+                    if value < min {
+                        continue;
+                    }
+                }
+                if let Some(max) = query.max {
+                    if value > max {
+                        continue;
+                    }
+                }
+            }
+
+            if let (Some(radius_km), Some(origin)) = (query.radius_km, start_point) {
+                let node_point = node
+                    .data
+                    .get(geo_key)
+                    .and_then(|value| parse_geo_point(value));
+                let node_point = match node_point {
+                    Some(point) => point,
+                    None => continue,
+                };
+                if haversine_km(origin, node_point) > radius_km {
+                    continue;
+                }
+            }
+
+            results.push(Recommendation {
+                id: node.id.clone(),
+                score,
+                data: node.data.clone(),
+            });
+        }
+
+        results
+    };
 
     results.sort_by(|left, right| {
         right
@@ -633,6 +918,18 @@ async fn recommend_nodes(
 
     if let Some(limit) = query.limit {
         results.truncate(limit);
+    }
+
+    let hydrate = query.hydrate.unwrap_or(true);
+    if hydrate && !results.is_empty() {
+        let ids: Vec<String> = results.iter().map(|item| item.id.clone()).collect();
+        let hydrated = run_db(state.db.clone(), move |db| load_node_data_for_ids(db, &ids))
+            .await?;
+        for item in &mut results {
+            if let Some(data) = hydrated.get(&item.id) {
+                item.data = data.clone();
+            }
+        }
     }
 
     Ok(Json(results))
@@ -671,6 +968,8 @@ async fn list_nearby(
         .unwrap_or_else(|| "geo_hash".to_string());
     let node_type = query.r#type.clone();
     let limit = query.limit;
+    let hydrate = query.hydrate.unwrap_or(true);
+    let schema = state.schema.read().await.clone();
 
     let results = run_db(state.db.clone(), move |db| {
         list_nodes_by_geo_prefix(
@@ -679,6 +978,8 @@ async fn list_nearby(
             geo_hash_key.as_str(),
             geo_hash_prefix.as_str(),
             limit,
+            &schema,
+            hydrate,
         )
     })
     .await?;
@@ -788,26 +1089,127 @@ fn init_db(db: &Database) -> Result<(), redb::Error> {
     write_txn.open_table(NODE_INDEX_TABLE)?;
     write_txn.open_table(EDGE_INDEX_TABLE)?;
     write_txn.open_table(GEO_INDEX_TABLE)?;
+    write_txn.open_table(SCHEMA_TABLE)?;
     write_txn.commit()?;
     Ok(())
 }
 
-fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
-    let mut graph = Graph::new();
-    let mut decode_cache = LruCache::new(4096);
+fn serialize_schema_fields(fields: &[String]) -> String {
+    let sep = KEY_SEP.to_string();
+    let mut encoded: Vec<String> = fields.iter().map(|field| encode_component(field)).collect();
+    encoded.sort();
+    encoded.dedup();
+    encoded.join(&sep)
+}
 
-    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+fn deserialize_schema_fields(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    value
+        .split(KEY_SEP)
+        .filter_map(|entry| decode_component(entry))
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
 
+fn load_schema(db: &Database) -> Result<SchemaCache, redb::Error> {
     let read_txn = db.begin_read()?;
-    let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
-    for entry in nodes_table.iter()? {
-        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some(node_id) = decode_component_cached(key.value(), &mut decode_cache) {
-            graph.add_node(&node_id);
+    let schema_table: ReadOnlyTable<&str, &str> = read_txn.open_table(SCHEMA_TABLE)?;
+    let mut schema = SchemaCache::default();
+
+    if let Some(value) = schema_table.get("node")? {
+        let fields = deserialize_schema_fields(value.value());
+        if !fields.is_empty() {
+            schema.node_fields = fields.into_iter().collect();
+            schema.node_defined = true;
+        }
+    }
+    if let Some(value) = schema_table.get("edge")? {
+        let fields = deserialize_schema_fields(value.value());
+        if !fields.is_empty() {
+            schema.edge_fields = fields.into_iter().collect();
+            schema.edge_defined = true;
         }
     }
 
+    Ok(schema)
+}
+
+fn save_schema(db: &Database, entity: &str, fields: &[String]) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut schema_table = write_txn.open_table(SCHEMA_TABLE)?;
+        let value = serialize_schema_fields(fields);
+        schema_table.insert(entity, value.as_str())?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+fn ensure_status_defaults(db: &Database) -> Result<(), redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+    let mut decode_cache = LruCache::new(4096);
+
+    let read_txn = db.begin_read()?;
+    let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+    let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
     let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
+
+    let mut nodes_with_status = HashSet::new();
+    for entry in node_data_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((node_id_encoded, data_key_encoded)) = split_two(key.value()) {
+            let node_id = match decode_component_cached(node_id_encoded, &mut decode_cache) {
+                Some(node_id) => node_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
+            if data_key == STATUS_KEY {
+                nodes_with_status.insert(node_id);
+            }
+        }
+    }
+
+    let mut edges_with_status = HashSet::new();
+    for entry in edge_data_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id_encoded, to_id_encoded, data_key_encoded)) = split_three(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
+                Some(data_key) => data_key,
+                None => continue,
+            };
+            if data_key == STATUS_KEY {
+                edges_with_status.insert(edge_key(&from_id, &to_id));
+            }
+        }
+    }
+
+    let mut missing_nodes = Vec::new();
+    for entry in nodes_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        let node_id = match decode_component_cached(key.value(), &mut decode_cache) {
+            Some(node_id) => node_id,
+            None => continue,
+        };
+        if !nodes_with_status.contains(&node_id) {
+            missing_nodes.push(node_id);
+        }
+    }
+
+    let mut missing_edges = Vec::new();
     for entry in edges_table.iter()? {
         let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
         if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
@@ -819,10 +1221,73 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
                 Some(to_id) => to_id,
                 None => continue,
             };
-            graph.add_edge(&from_id, &to_id);
+            if !edges_with_status.contains(&edge_key(&from_id, &to_id)) {
+                missing_edges.push((from_id, to_id));
+            }
         }
     }
 
+    if missing_nodes.is_empty() && missing_edges.is_empty() {
+        return Ok(());
+    }
+
+    let write_txn = db.begin_write()?;
+    {
+        if !missing_nodes.is_empty() {
+            let mut node_data_table = write_txn.open_table(NODE_DATA_TABLE)?;
+            let mut node_index_table = write_txn.open_table(NODE_INDEX_TABLE)?;
+            let mut geo_index_table = write_txn.open_table(GEO_INDEX_TABLE)?;
+            for node_id in missing_nodes {
+                let data_key = node_data_key(&node_id, STATUS_KEY);
+                node_data_table.insert(data_key.as_str(), STATUS_ACTIVE)?;
+                let index_key = node_index_key(STATUS_KEY, STATUS_ACTIVE, &node_id);
+                node_index_table.insert(index_key.as_str(), "")?;
+                let geo_key = geo_index_key(STATUS_KEY, STATUS_ACTIVE, &node_id);
+                geo_index_table.insert(geo_key.as_str(), "")?;
+            }
+        }
+
+        if !missing_edges.is_empty() {
+            let mut edge_data_table = write_txn.open_table(EDGE_DATA_TABLE)?;
+            let mut edge_index_table = write_txn.open_table(EDGE_INDEX_TABLE)?;
+            for (from_id, to_id) in missing_edges {
+                let data_key = edge_data_key(&from_id, &to_id, STATUS_KEY);
+                edge_data_table.insert(data_key.as_str(), STATUS_ACTIVE)?;
+                let index_key = edge_index_key(STATUS_KEY, STATUS_ACTIVE, &from_id, &to_id);
+                edge_index_table.insert(index_key.as_str(), "")?;
+            }
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+fn load_graph(db: &Database, schema: &SchemaCache) -> Result<Graph, redb::Error> {
+    let mut graph = Graph::new();
+    let mut decode_cache = LruCache::new(4096);
+
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+
+    let active_nodes = list_node_ids_by_index(db, STATUS_KEY, STATUS_ACTIVE)?;
+    if active_nodes.is_empty() {
+        return Ok(graph);
+    }
+    let active_node_set: HashSet<String> = active_nodes.iter().cloned().collect();
+    for node_id in &active_nodes {
+        graph.add_node(node_id);
+    }
+
+    let active_edges = list_edge_ids_by_index(db, STATUS_KEY, STATUS_ACTIVE)?;
+    let mut active_edge_keys = HashSet::new();
+    for (from_id, to_id) in active_edges {
+        if !active_node_set.contains(&from_id) || !active_node_set.contains(&to_id) {
+            continue;
+        }
+        graph.add_edge(&from_id, &to_id);
+        active_edge_keys.insert(edge_key(&from_id, &to_id));
+    }
+
+    let read_txn = db.begin_read()?;
     let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
     for entry in node_data_table.iter()? {
         let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
@@ -831,11 +1296,16 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
                 Some(node_id) => node_id,
                 None => continue,
             };
+            if !active_node_set.contains(&node_id) {
+                continue;
+            }
             let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
                 Some(data_key) => data_key,
                 None => continue,
             };
-            graph.set_node_data(&node_id, &data_key, value.value());
+            if schema.node_in_memory(&data_key) {
+                graph.set_node_data(&node_id, &data_key, value.value());
+            }
         }
     }
 
@@ -851,18 +1321,40 @@ fn load_graph(db: &Database) -> Result<Graph, redb::Error> {
                 Some(to_id) => to_id,
                 None => continue,
             };
+            let edge_key_value = edge_key(&from_id, &to_id);
+            if !active_edge_keys.contains(&edge_key_value) {
+                continue;
+            }
             let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
                 Some(data_key) => data_key,
                 None => continue,
             };
-            graph.set_edge_data(&from_id, &to_id, &data_key, value.value());
+            if schema.edge_in_memory(&data_key) {
+                graph.set_edge_data(&from_id, &to_id, &data_key, value.value());
+            }
         }
     }
 
     Ok(graph)
 }
 
-fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, redb::Error> {
+fn is_active_value(value: Option<&String>) -> bool {
+    match value {
+        Some(value) => value == STATUS_ACTIVE,
+        None => true,
+    }
+}
+
+fn is_active_data(data: &HashMap<String, String>) -> bool {
+    is_active_value(data.get(STATUS_KEY))
+}
+
+fn get_node_from_db(
+    db: &Database,
+    node_id: &str,
+    schema: &SchemaCache,
+    hydrate: bool,
+) -> Result<Option<NodeView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
 
     let mut decode_cache = LruCache::new(2048);
@@ -890,6 +1382,9 @@ fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, re
                 data.insert(data_key, value.value().to_string());
             }
         }
+    }
+    if !is_active_data(&data) {
+        return Ok(None);
     }
 
     let mut edges = Vec::new();
@@ -935,10 +1430,24 @@ fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, re
                 let data = edge_data
                     .remove(&edge_key(&from_id, &to_id))
                     .unwrap_or_default();
+                if !is_active_data(&data) {
+                    continue;
+                }
+                let data = if hydrate {
+                    data
+                } else {
+                    schema.filter_edge_data(&data)
+                };
                 edges.push(EdgeView { to: to_id, data });
             }
         }
     }
+
+    let data = if hydrate {
+        data
+    } else {
+        schema.filter_node_data(&data)
+    };
 
     Ok(Some(NodeView {
         id: node_id.to_string(),
@@ -950,56 +1459,29 @@ fn get_node_from_db(db: &Database, node_id: &str) -> Result<Option<NodeView>, re
 fn list_nodes_from_db(
     db: &Database,
     node_type: Option<&str>,
+    schema: &SchemaCache,
+    hydrate: bool,
 ) -> Result<Vec<NodeView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
     let mut decode_cache = LruCache::new(4096);
 
-    if let Some(node_type) = node_type {
-        let node_ids = list_node_ids_by_index(db, "type", node_type)?;
-        if node_ids.is_empty() {
-            return Ok(Vec::new());
-        }
+    let active_nodes = list_node_ids_by_index(db, STATUS_KEY, STATUS_ACTIVE)?;
+    if active_nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let active_set: HashSet<String> = active_nodes.iter().cloned().collect();
 
-        let read_txn = db.begin_read()?;
-        let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
-        let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
-        let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
-        let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
-
-        let mut nodes = Vec::new();
-        for node_id in node_ids {
-            let encoded_node_id = encode_component(&node_id);
-            if nodes_table.get(encoded_node_id.as_str())?.is_none() {
-                continue;
-            }
-            let data = load_node_data_for_id(&node_data_table, &node_id)?;
-            let edge_data = load_edge_data_for_from(&edge_data_table, &node_id)?;
-            let mut edges = Vec::new();
-            let prefix = edge_from_prefix(&node_id);
-            for entry in edges_table.range(prefix.as_str()..)? {
-                let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-                let key_value = key.value();
-                if !key_value.starts_with(&prefix) {
-                    break;
-                }
-                if let Some((_, to_id_encoded)) = split_two(key_value) {
-                    let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
-                        Some(to_id) => to_id,
-                        None => continue,
-                    };
-                    let data = edge_data.get(&to_id).cloned().unwrap_or_default();
-                    edges.push(EdgeView { to: to_id, data });
-                }
-            }
-
-            nodes.push(NodeView {
-                id: node_id,
-                data,
-                edges,
-            });
-        }
-
-        return Ok(nodes);
+    let node_ids = if let Some(node_type) = node_type {
+        let typed_nodes = list_node_ids_by_index(db, "type", node_type)?;
+        typed_nodes
+            .into_iter()
+            .filter(|node_id| active_set.contains(node_id))
+            .collect::<Vec<_>>()
+    } else {
+        active_nodes
+    };
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
     let read_txn = db.begin_read()?;
@@ -1008,88 +1490,49 @@ fn list_nodes_from_db(
     let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
     let edge_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGE_DATA_TABLE)?;
 
-    let mut node_data: HashMap<String, HashMap<String, String>> = HashMap::new();
-    for entry in node_data_table.iter()? {
-        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((node_id_encoded, data_key_encoded)) = split_two(key.value()) {
-            let node_id = match decode_component_cached(node_id_encoded, &mut decode_cache) {
-                Some(node_id) => node_id,
-                None => continue,
-            };
-            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
-                Some(data_key) => data_key,
-                None => continue,
-            };
-            node_data
-                .entry(node_id)
-                .or_default()
-                .insert(data_key, value.value().to_string());
-        }
-    }
-
-    let mut edges_by_from: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in edges_table.iter()? {
-        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
-            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
-                Some(from_id) => from_id,
-                None => continue,
-            };
-            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
-                Some(to_id) => to_id,
-                None => continue,
-            };
-            edges_by_from.entry(from_id).or_default().push(to_id);
-        }
-    }
-
-    let mut edge_data: HashMap<String, HashMap<String, String>> = HashMap::new();
-    for entry in edge_data_table.iter()? {
-        let (key, value): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        if let Some((from_id_encoded, to_id_encoded, data_key_encoded)) = split_three(key.value()) {
-            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
-                Some(from_id) => from_id,
-                None => continue,
-            };
-            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
-                Some(to_id) => to_id,
-                None => continue,
-            };
-            let data_key = match decode_component_cached(data_key_encoded, &mut decode_cache) {
-                Some(data_key) => data_key,
-                None => continue,
-            };
-            edge_data
-                .entry(edge_key(&from_id, &to_id))
-                .or_default()
-                .insert(data_key, value.value().to_string());
-        }
-    }
-
     let mut nodes = Vec::new();
-    for entry in nodes_table.iter()? {
-        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
-        let node_id = match decode_component_cached(key.value(), &mut decode_cache) {
-            Some(node_id) => node_id,
-            None => continue,
-        };
-        let data = node_data.remove(&node_id).unwrap_or_default();
+    for node_id in node_ids {
+        let encoded_node_id = encode_component(&node_id);
+        if nodes_table.get(encoded_node_id.as_str())?.is_none() {
+            continue;
+        }
+        let mut data = load_node_data_for_id(&node_data_table, &node_id)?;
+        if !is_active_data(&data) {
+            continue;
+        }
         if let Some(node_type) = node_type {
             if data.get("type").map(|value| value.as_str()) != Some(node_type) {
                 continue;
             }
         }
-
+        if !hydrate {
+            data = schema.filter_node_data(&data);
+        }
+        let edge_data = load_edge_data_for_from(&edge_data_table, &node_id)?;
         let mut edges = Vec::new();
-        if let Some(to_list) = edges_by_from.get(&node_id) {
-            for to_id in to_list {
-                let data = edge_data
-                    .remove(&edge_key(&node_id, to_id))
-                    .unwrap_or_default();
-                edges.push(EdgeView {
-                    to: to_id.clone(),
-                    data,
-                });
+        let prefix = edge_from_prefix(&node_id);
+        for entry in edges_table.range(prefix.as_str()..)? {
+            let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+            let key_value = key.value();
+            if !key_value.starts_with(&prefix) {
+                break;
+            }
+            if let Some((_, to_id_encoded)) = split_two(key_value) {
+                let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                    Some(to_id) => to_id,
+                    None => continue,
+                };
+                if !active_set.contains(&to_id) {
+                    continue;
+                }
+                let mut data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                if !is_active_data(&data) {
+                    continue;
+                }
+                if !hydrate {
+                    data = schema.filter_edge_data(&data);
+                }
+                edges.push(EdgeView { to: to_id, data });
             }
         }
 
@@ -1109,10 +1552,24 @@ fn list_nodes_by_geo_prefix(
     geo_key: &str,
     geo_prefix: &str,
     limit: Option<usize>,
+    schema: &SchemaCache,
+    hydrate: bool,
 ) -> Result<Vec<NodeView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
 
     let node_ids = list_node_ids_by_geo_prefix(db, geo_key, geo_prefix)?;
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let active_nodes = list_node_ids_by_index(db, STATUS_KEY, STATUS_ACTIVE)?;
+    if active_nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let active_set: HashSet<String> = active_nodes.into_iter().collect();
+    let node_ids = node_ids
+        .into_iter()
+        .filter(|node_id| active_set.contains(node_id))
+        .collect::<Vec<_>>();
     if node_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1130,9 +1587,15 @@ fn list_nodes_by_geo_prefix(
         if nodes_table.get(encoded_node_id.as_str())?.is_none() {
             continue;
         }
-        let data = load_node_data_for_id(&node_data_table, &node_id)?;
+        let mut data = load_node_data_for_id(&node_data_table, &node_id)?;
+        if !is_active_data(&data) {
+            continue;
+        }
         if data.get("type").map(|value| value.as_str()) != Some(node_type) {
             continue;
+        }
+        if !hydrate {
+            data = schema.filter_node_data(&data);
         }
         let edge_data = load_edge_data_for_from(&edge_data_table, &node_id)?;
         let mut edges = Vec::new();
@@ -1148,7 +1611,16 @@ fn list_nodes_by_geo_prefix(
                     Some(to_id) => to_id,
                     None => continue,
                 };
-                let data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                if !active_set.contains(&to_id) {
+                    continue;
+                }
+                let mut data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                if !is_active_data(&data) {
+                    continue;
+                }
+                if !hydrate {
+                    data = schema.filter_edge_data(&data);
+                }
                 edges.push(EdgeView { to: to_id, data });
             }
         }
@@ -1173,9 +1645,19 @@ fn list_edges_from_db(
     edge_type: Option<&str>,
     from_filter: Option<&str>,
     to_filter: Option<&str>,
+    schema: &SchemaCache,
+    hydrate: bool,
 ) -> Result<Vec<EdgeListView>, redb::Error> {
     type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
     let mut decode_cache = LruCache::new(4096);
+    let active_edges = list_edge_ids_by_index(db, STATUS_KEY, STATUS_ACTIVE)?;
+    if active_edges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut active_edge_keys = HashSet::new();
+    for (from_id, to_id) in active_edges {
+        active_edge_keys.insert(edge_key(&from_id, &to_id));
+    }
 
     if let Some(edge_type) = edge_type {
         let edges = list_edge_ids_by_index(db, "type", edge_type)?;
@@ -1189,6 +1671,9 @@ fn list_edges_from_db(
 
         let mut results = Vec::new();
         for (from_id, to_id) in edges {
+            if !active_edge_keys.contains(&edge_key(&from_id, &to_id)) {
+                continue;
+            }
             if let Some(from_filter) = from_filter {
                 if from_id != from_filter {
                     continue;
@@ -1205,7 +1690,10 @@ fn list_edges_from_db(
             {
                 continue;
             }
-            let data = load_edge_data_for_edge(&edge_data_table, &from_id, &to_id)?;
+            let mut data = load_edge_data_for_edge(&edge_data_table, &from_id, &to_id)?;
+            if !hydrate {
+                data = schema.filter_edge_data(&data);
+            }
             results.push(EdgeListView {
                 from: from_id,
                 to: to_id,
@@ -1240,7 +1728,16 @@ fn list_edges_from_db(
                         continue;
                     }
                 }
-                let data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                if !active_edge_keys.contains(&edge_key(from_filter, &to_id)) {
+                    continue;
+                }
+                let mut data = edge_data.get(&to_id).cloned().unwrap_or_default();
+                if !is_active_data(&data) {
+                    continue;
+                }
+                if !hydrate {
+                    data = schema.filter_edge_data(&data);
+                }
                 results.push(EdgeListView {
                     from: from_filter.to_string(),
                     to: to_id,
@@ -1286,6 +1783,9 @@ fn list_edges_from_db(
                 Some(to_id) => to_id,
                 None => continue,
             };
+            if !active_edge_keys.contains(&edge_key(&from_id, &to_id)) {
+                continue;
+            }
             if let Some(from_filter) = from_filter {
                 if from_id != from_filter {
                     continue;
@@ -1297,9 +1797,15 @@ fn list_edges_from_db(
                 }
             }
 
-            let data = edge_data
+            let mut data = edge_data
                 .remove(&edge_key(&from_id, &to_id))
                 .unwrap_or_default();
+            if !is_active_data(&data) {
+                continue;
+            }
+            if !hydrate {
+                data = schema.filter_edge_data(&data);
+            }
             if let Some(edge_type) = edge_type {
                 if data.get("type").map(|value| value.as_str()) != Some(edge_type) {
                     continue;
@@ -1326,6 +1832,83 @@ where
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .map_err(db_error)
+}
+
+fn soft_delete_node(db: &Database, node_id: &str) -> Result<bool, redb::Error> {
+    let exists = {
+        let read_txn = db.begin_read()?;
+        let nodes_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODES_TABLE)?;
+        let encoded_node_id = encode_component(node_id);
+        nodes_table.get(encoded_node_id.as_str())?.is_some()
+    };
+    if !exists {
+        return Ok(false);
+    }
+    insert_node_data(db, node_id, STATUS_KEY, STATUS_DELETED)?;
+    mark_edges_deleted_for_node(db, node_id)?;
+    Ok(true)
+}
+
+fn soft_delete_edge(db: &Database, from: &str, to: &str) -> Result<bool, redb::Error> {
+    let exists = {
+        let read_txn = db.begin_read()?;
+        let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+        edges_table.get(edge_key(from, to).as_str())?.is_some()
+    };
+    if !exists {
+        return Ok(false);
+    }
+    insert_edge_data(db, from, to, STATUS_KEY, STATUS_DELETED)?;
+    Ok(true)
+}
+
+fn mark_edges_deleted_for_node(db: &Database, node_id: &str) -> Result<(), redb::Error> {
+    type StrGuard<'a> = redb::AccessGuard<'a, &'static str>;
+    let mut decode_cache = LruCache::new(4096);
+    let read_txn = db.begin_read()?;
+    let edges_table: ReadOnlyTable<&str, &str> = read_txn.open_table(EDGES_TABLE)?;
+    let mut edges_to_delete = Vec::new();
+    for entry in edges_table.iter()? {
+        let (key, _): (StrGuard<'_>, StrGuard<'_>) = entry?;
+        if let Some((from_id_encoded, to_id_encoded)) = split_two(key.value()) {
+            let from_id = match decode_component_cached(from_id_encoded, &mut decode_cache) {
+                Some(from_id) => from_id,
+                None => continue,
+            };
+            let to_id = match decode_component_cached(to_id_encoded, &mut decode_cache) {
+                Some(to_id) => to_id,
+                None => continue,
+            };
+            if from_id == node_id || to_id == node_id {
+                edges_to_delete.push((from_id, to_id));
+            }
+        }
+    }
+
+    if edges_to_delete.is_empty() {
+        return Ok(());
+    }
+
+    let write_txn = db.begin_write()?;
+    {
+        let mut edge_data_table = write_txn.open_table(EDGE_DATA_TABLE)?;
+        let mut edge_index_table = write_txn.open_table(EDGE_INDEX_TABLE)?;
+        for (from_id, to_id) in edges_to_delete {
+            let data_key = edge_data_key(&from_id, &to_id, STATUS_KEY);
+            let previous = edge_data_table
+                .get(data_key.as_str())?
+                .map(|value| value.value().to_string());
+            edge_data_table.insert(data_key.as_str(), STATUS_DELETED)?;
+            if let Some(previous) = previous {
+                let previous_key = edge_index_key(STATUS_KEY, &previous, &from_id, &to_id);
+                edge_index_table.remove(previous_key.as_str())?;
+            }
+            let index_key = edge_index_key(STATUS_KEY, STATUS_DELETED, &from_id, &to_id);
+            edge_index_table.insert(index_key.as_str(), "")?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
 }
 
 fn insert_node(db: &Database, node_id: &str) -> Result<(), redb::Error> {
@@ -1736,6 +2319,23 @@ fn load_node_data_for_id(
         }
     }
     Ok(data)
+}
+
+fn load_node_data_for_ids(
+    db: &Database,
+    node_ids: &[String],
+) -> Result<HashMap<String, HashMap<String, String>>, redb::Error> {
+    let read_txn = db.begin_read()?;
+    let node_data_table: ReadOnlyTable<&str, &str> = read_txn.open_table(NODE_DATA_TABLE)?;
+    let mut results = HashMap::new();
+    for node_id in node_ids {
+        let data = load_node_data_for_id(&node_data_table, node_id)?;
+        if !is_active_data(&data) {
+            continue;
+        }
+        results.insert(node_id.clone(), data);
+    }
+    Ok(results)
 }
 
 fn load_edge_data_for_from(

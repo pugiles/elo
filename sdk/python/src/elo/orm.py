@@ -16,6 +16,7 @@ class NodeMeta:
     node_type: Optional[str] = None
     geo_key: str = "location"
     geo_hash_key: str = "geo_hash"
+    schema_fields: Optional[List[str]] = None
 
 
 TNode = TypeVar("TNode", bound="Node")
@@ -130,3 +131,11 @@ class Node:
             except ValueError:
                 pass
         return cls(id=view.id, **data)
+
+    @classmethod
+    def register_schema(cls) -> None:
+        fields = getattr(cls.Meta, "schema_fields", None)
+        if not fields:
+            return
+        client = get_client()
+        client.upsert_schema("node", fields)
