@@ -52,16 +52,29 @@ curl -X PATCH http://127.0.0.1:3000/edges \
   -H "x-api-key: your_token" -H "content-type: application/json" \
   -d '{"from":"user:123","to":"team:42","data":{"role":"owner","since":"2025"}}'
 
+curl -X POST http://127.0.0.1:3000/blocks \
+  -H "x-api-key: your_token" -H "content-type: application/json" \
+  -d '{"from":"user:123","to":"user:456"}'
+
+curl -X DELETE "http://127.0.0.1:3000/blocks?from=user:123&to=user:456" \
+  -H "x-api-key: your_token"
+
 curl "http://127.0.0.1:3000/nodes?type=team&hydrate=false" \
   -H "x-api-key: your_token"
 
 curl "http://127.0.0.1:3000/edges?type=owner&hydrate=false" \
   -H "x-api-key: your_token"
 
-curl "http://127.0.0.1:3000/recommendations?start=user:123&type=team&radius_km=10&hydrate=false" \
+Notes:
+- Edges with `type=block` are mirrored automatically (A->B also creates B->A). `type=mute` stays one-way.
+
+curl "http://127.0.0.1:3000/recommendations?start=user:123&type=team&radius_km=10&exclude_edge_types=block,mute&hydrate=false" \
   -H "x-api-key: your_token"
 
 curl "http://127.0.0.1:3000/nearby?type=Gym&geo_hash_prefix=6gkzwg" \
+  -H "x-api-key: your_token"
+
+curl "http://127.0.0.1:3000/nearby?type=Gym&geo_hash_prefix=6gkzwg&start=user:123&exclude_edge_types=block,mute" \
   -H "x-api-key: your_token"
 
 curl "http://127.0.0.1:3000/nearby?type=Gym&lat=-22.9068&lon=-43.1729&radius_km=10" \

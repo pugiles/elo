@@ -7,6 +7,8 @@ def main() -> None:
     client.create_node("user:123", data={"type": "user"})
     client.create_node("team:42", data={"type": "team", "rating": "520"})
     client.create_edge("user:123", "team:42", data={"type": "owner"})
+    client.block("user:123", "user:456")
+    client.unblock("user:123", "user:456")
 
     node = client.get_node("user:123")
     print(node.id, node.data, node.edges)
@@ -22,6 +24,7 @@ def main() -> None:
         min_value=300,
         max_value=900,
         limit=5,
+        exclude_edge_types=["block", "mute"],
     )
     print(recs)
 

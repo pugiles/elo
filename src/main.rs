@@ -138,6 +138,13 @@ impl Graph {
             .unwrap_or(false)
     }
 
+    fn edge_type(&self, from: &str, to: &str) -> Option<&str> {
+        self.nodes
+            .get(from)
+            .and_then(|node| node.neighbors.iter().find(|edge| edge.to == to))
+            .and_then(|edge| edge.data.get("type").map(|value| value.as_str()))
+    }
+
     fn get_node(&self, id: &str) -> Option<&Node> {
         self.nodes.get(id)
     }
@@ -209,6 +216,13 @@ struct CreateNode {
 
 #[derive(Deserialize)]
 struct CreateEdge {
+    from: String,
+    to: String,
+    data: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct BlockPayload {
     from: String,
     to: String,
     data: Option<HashMap<String, String>>,
@@ -313,6 +327,8 @@ struct RecommendQuery {
     lon: Option<f64>,
     radius_km: Option<f64>,
     hydrate: Option<bool>,
+    exclude_edge_types: Option<String>,
+    exclude_ids: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -324,6 +340,7 @@ struct Recommendation {
 
 #[derive(Deserialize)]
 struct NearbyQuery {
+    start: Option<String>,
     r#type: String,
     geo_hash_prefix: Option<String>,
     geo_hash_key: Option<String>,
@@ -332,6 +349,8 @@ struct NearbyQuery {
     radius_km: Option<f64>,
     limit: Option<usize>,
     hydrate: Option<bool>,
+    exclude_edge_types: Option<String>,
+    exclude_ids: Option<String>,
 }
 
 #[tokio::main]
@@ -370,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .get(list_edges)
                 .delete(delete_edge),
         )
+        .route("/blocks", post(create_block).delete(delete_block))
         .route("/schema", post(upsert_schema).get(get_schema))
         .route("/path", get(check_path))
         .route("/recommendations", get(recommend_nodes))
@@ -446,6 +466,10 @@ async fn create_edge(
     if !data.contains_key(STATUS_KEY) {
         data.insert(STATUS_KEY.to_string(), STATUS_ACTIVE.to_string());
     }
+    let is_block = data
+        .get("type")
+        .map(|value| value.as_str() == "block")
+        .unwrap_or(false);
     run_db(state.db.clone(), move |db| insert_edge(db, &from, &to)).await?;
     let schema = state.schema.read().await.clone();
     let mut graph = state.graph.write().await;
@@ -455,9 +479,88 @@ async fn create_edge(
     let data_clone = data.clone();
     run_db(state.db.clone(), move |db| insert_edge_data_bulk(db, &from_id, &to_id, &data_clone))
         .await?;
-    for (key, value) in data {
+    for (key, value) in &data {
         if schema.edge_in_memory(&key) {
             graph.set_edge_data(&payload.from, &payload.to, &key, &value);
+        }
+    }
+
+    if is_block && payload.from != payload.to {
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let reverse_data = data.clone();
+        if !graph.has_edge(&payload.to, &payload.from) {
+            run_db(state.db.clone(), move |db| insert_edge(db, &reverse_from, &reverse_to)).await?;
+            graph.add_edge(&payload.to, &payload.from);
+        }
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let reverse_data_clone = reverse_data.clone();
+        run_db(state.db.clone(), move |db| {
+            insert_edge_data_bulk(db, &reverse_from, &reverse_to, &reverse_data_clone)
+        })
+        .await?;
+        for (key, value) in &reverse_data {
+            if schema.edge_in_memory(key) {
+                graph.set_edge_data(&payload.to, &payload.from, key, value);
+            }
+        }
+    }
+
+    Ok(StatusCode::CREATED)
+}
+
+async fn create_block(
+    State(state): State<AppState>,
+    Json(payload): Json<BlockPayload>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_node(&payload.from) || !graph.has_node(&payload.to) {
+            return Err((StatusCode::NOT_FOUND, "node not found".to_string()));
+        }
+    }
+    let from = payload.from.clone();
+    let to = payload.to.clone();
+    let mut data = payload.data.unwrap_or_default();
+    data.insert("type".to_string(), "block".to_string());
+    if !data.contains_key(STATUS_KEY) {
+        data.insert(STATUS_KEY.to_string(), STATUS_ACTIVE.to_string());
+    }
+    run_db(state.db.clone(), move |db| insert_edge(db, &from, &to)).await?;
+    let schema = state.schema.read().await.clone();
+    let mut graph = state.graph.write().await;
+    graph.add_edge(&payload.from, &payload.to);
+    let from_id = payload.from.clone();
+    let to_id = payload.to.clone();
+    let data_clone = data.clone();
+    run_db(state.db.clone(), move |db| insert_edge_data_bulk(db, &from_id, &to_id, &data_clone))
+        .await?;
+    for (key, value) in &data {
+        if schema.edge_in_memory(key) {
+            graph.set_edge_data(&payload.from, &payload.to, key, value);
+        }
+    }
+
+    if payload.from != payload.to {
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let reverse_data = data.clone();
+        if !graph.has_edge(&payload.to, &payload.from) {
+            run_db(state.db.clone(), move |db| insert_edge(db, &reverse_from, &reverse_to)).await?;
+            graph.add_edge(&payload.to, &payload.from);
+        }
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let reverse_data_clone = reverse_data.clone();
+        run_db(state.db.clone(), move |db| {
+            insert_edge_data_bulk(db, &reverse_from, &reverse_to, &reverse_data_clone)
+        })
+        .await?;
+        for (key, value) in &reverse_data {
+            if schema.edge_in_memory(key) {
+                graph.set_edge_data(&payload.to, &payload.from, key, value);
+            }
         }
     }
 
@@ -520,6 +623,30 @@ async fn set_edge_data(
     if payload.key == STATUS_KEY && payload.value == STATUS_DELETED {
         graph.remove_edge(&payload.from, &payload.to);
     }
+    if payload.key == "type" && payload.value == "block" && payload.from != payload.to {
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let mut reverse_data = HashMap::new();
+        reverse_data.insert("type".to_string(), "block".to_string());
+        reverse_data.insert(STATUS_KEY.to_string(), STATUS_ACTIVE.to_string());
+        if !graph.has_edge(&payload.to, &payload.from) {
+            run_db(state.db.clone(), move |db| insert_edge(db, &reverse_from, &reverse_to)).await?;
+            graph.add_edge(&payload.to, &payload.from);
+        }
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let reverse_data_clone = reverse_data.clone();
+        run_db(state.db.clone(), move |db| {
+            insert_edge_data_bulk(db, &reverse_from, &reverse_to, &reverse_data_clone)
+        })
+        .await?;
+        if schema.edge_in_memory("type") {
+            graph.set_edge_data(&payload.to, &payload.from, "type", "block");
+        }
+        if schema.edge_in_memory(STATUS_KEY) {
+            graph.set_edge_data(&payload.to, &payload.from, STATUS_KEY, STATUS_ACTIVE);
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -572,6 +699,10 @@ async fn update_edge_data(
     let from = payload.from.clone();
     let to = payload.to.clone();
     let data_clone = payload.data.clone();
+    let is_block = data_clone
+        .get("type")
+        .map(|value| value.as_str() == "block")
+        .unwrap_or(false);
     let from_db = from.clone();
     let to_db = to.clone();
     run_db(state.db.clone(), move |db| {
@@ -591,6 +722,30 @@ async fn update_edge_data(
     }
     if deleted {
         graph.remove_edge(&from, &to);
+    }
+    if is_block && payload.from != payload.to {
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let mut reverse_data = payload.data.clone();
+        if !reverse_data.contains_key(STATUS_KEY) {
+            reverse_data.insert(STATUS_KEY.to_string(), STATUS_ACTIVE.to_string());
+        }
+        if !graph.has_edge(&payload.to, &payload.from) {
+            run_db(state.db.clone(), move |db| insert_edge(db, &reverse_from, &reverse_to)).await?;
+            graph.add_edge(&payload.to, &payload.from);
+        }
+        let reverse_from = payload.to.clone();
+        let reverse_to = payload.from.clone();
+        let reverse_data_clone = reverse_data.clone();
+        run_db(state.db.clone(), move |db| {
+            insert_edge_data_bulk(db, &reverse_from, &reverse_to, &reverse_data_clone)
+        })
+        .await?;
+        for (key, value) in &reverse_data {
+            if schema.edge_in_memory(key) {
+                graph.set_edge_data(&payload.to, &payload.from, key, value);
+            }
+        }
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -616,12 +771,59 @@ async fn delete_edge(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let from = query.from.clone();
     let to = query.to.clone();
+    let is_block = {
+        let graph = state.graph.read().await;
+        graph.edge_type(&from, &to) == Some("block")
+    };
     let deleted = run_db(state.db.clone(), move |db| soft_delete_edge(db, &from, &to)).await?;
     if !deleted {
         return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
     }
+    if is_block && query.from != query.to {
+        let reverse_from = query.to.clone();
+        let reverse_to = query.from.clone();
+        let _ = run_db(state.db.clone(), move |db| {
+            soft_delete_edge(db, &reverse_from, &reverse_to)
+        })
+        .await?;
+    }
     let mut graph = state.graph.write().await;
     graph.remove_edge(&query.from, &query.to);
+    if is_block && query.from != query.to {
+        graph.remove_edge(&query.to, &query.from);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_block(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteEdgeQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    {
+        let graph = state.graph.read().await;
+        if !graph.has_edge(&query.from, &query.to) {
+            return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
+        }
+    }
+    let from = query.from.clone();
+    let to = query.to.clone();
+    let deleted = run_db(state.db.clone(), move |db| soft_delete_edge(db, &from, &to)).await?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "edge not found".to_string()));
+    }
+    if query.from != query.to {
+        let reverse_from = query.to.clone();
+        let reverse_to = query.from.clone();
+        let _ = run_db(state.db.clone(), move |db| {
+            soft_delete_edge(db, &reverse_from, &reverse_to)
+        })
+        .await?;
+    }
+    let mut graph = state.graph.write().await;
+    graph.remove_edge(&query.from, &query.to);
+    if query.from != query.to {
+        graph.remove_edge(&query.to, &query.from);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -827,16 +1029,34 @@ async fn recommend_nodes(
             ));
         }
 
-        let direct_neighbors: HashSet<String> =
-            start.neighbors.iter().map(|edge| edge.to.clone()).collect();
+        let excluded_edge_types = parse_csv_set(&query.exclude_edge_types);
+        let excluded_ids = parse_csv_set(&query.exclude_ids);
+        let mut blocked_targets: HashSet<String> = HashSet::new();
+        let mut direct_neighbors: HashSet<String> = HashSet::new();
+        for edge in &start.neighbors {
+            if is_edge_type_excluded(edge, &excluded_edge_types) {
+                blocked_targets.insert(edge.to.clone());
+                continue;
+            }
+            direct_neighbors.insert(edge.to.clone());
+        }
 
         let mut scores: HashMap<String, f64> = HashMap::new();
         for edge in &start.neighbors {
+            if is_edge_type_excluded(edge, &excluded_edge_types) {
+                continue;
+            }
             let weight1 = edge_weight(edge);
             if let Some(node) = graph.get_node(&edge.to) {
                 for edge2 in &node.neighbors {
+                    if is_edge_type_excluded(edge2, &excluded_edge_types) {
+                        continue;
+                    }
                     let candidate = &edge2.to;
                     if candidate == &query.start {
+                        continue;
+                    }
+                    if blocked_targets.contains(candidate) || excluded_ids.contains(candidate) {
                         continue;
                     }
                     if direct_neighbors.contains(candidate) {
@@ -969,20 +1189,41 @@ async fn list_nearby(
     let node_type = query.r#type.clone();
     let limit = query.limit;
     let hydrate = query.hydrate.unwrap_or(true);
+    let excluded_edge_types = parse_csv_set(&query.exclude_edge_types);
+    let mut excluded_ids = parse_csv_set(&query.exclude_ids);
+    if let Some(start_id) = query.start.as_deref() {
+        let graph = state.graph.read().await;
+        let start = graph
+            .get_node(start_id)
+            .ok_or((StatusCode::NOT_FOUND, "start node not found".to_string()))?;
+        for edge in &start.neighbors {
+            if is_edge_type_excluded(edge, &excluded_edge_types) {
+                excluded_ids.insert(edge.to.clone());
+            }
+        }
+    }
     let schema = state.schema.read().await.clone();
+    let db_limit = if excluded_ids.is_empty() { limit } else { None };
 
-    let results = run_db(state.db.clone(), move |db| {
+    let mut results = run_db(state.db.clone(), move |db| {
         list_nodes_by_geo_prefix(
             db,
             node_type.as_str(),
             geo_hash_key.as_str(),
             geo_hash_prefix.as_str(),
-            limit,
+            db_limit,
             &schema,
             hydrate,
         )
     })
     .await?;
+
+    if !excluded_ids.is_empty() {
+        results.retain(|node| !excluded_ids.contains(&node.id));
+    }
+    if let Some(limit) = limit {
+        results.truncate(limit);
+    }
 
     Ok(Json(results))
 }
@@ -992,6 +1233,24 @@ fn edge_weight(edge: &Edge) -> f64 {
         .get("weight")
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(1.0)
+}
+
+fn parse_csv_set(value: &Option<String>) -> HashSet<String> {
+    value
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn is_edge_type_excluded(edge: &Edge, excluded: &HashSet<String>) -> bool {
+    match edge.data.get("type") {
+        Some(value) => excluded.contains(value),
+        None => false,
+    }
 }
 
 fn parse_geo_point(value: &str) -> Option<(f64, f64)> {

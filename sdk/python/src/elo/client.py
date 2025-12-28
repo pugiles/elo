@@ -64,6 +64,17 @@ class EloClient:
                 payload["data"] = data
         self._request("POST", "/edges", json=payload)
 
+    def block(
+        self, from_id: str, to_id: str, data: Optional[Dict[str, str]] = None
+    ) -> None:
+        payload: Dict[str, Any] = {"from": from_id, "to": to_id}
+        if data:
+            payload["data"] = data
+        self._request("POST", "/blocks", json=payload)
+
+    def unblock(self, from_id: str, to_id: str) -> None:
+        self._request("DELETE", "/blocks", params={"from": from_id, "to": to_id})
+
     def set_node_data(self, node_id: str, key: str, value: str) -> None:
         self._request(
             "PUT",
@@ -164,16 +175,25 @@ class EloClient:
         node_type: str,
         geo_hash_prefix: str,
         geo_hash_key: Optional[str] = None,
+        start: Optional[str] = None,
         limit: Optional[int] = None,
         hydrate: Optional[bool] = None,
+        exclude_edge_types: Optional[Iterable[str]] = None,
+        exclude_ids: Optional[Iterable[str]] = None,
     ) -> List[NodeView]:
         params: Dict[str, str] = {"type": node_type, "geo_hash_prefix": geo_hash_prefix}
         if geo_hash_key:
             params["geo_hash_key"] = geo_hash_key
+        if start:
+            params["start"] = start
         if limit is not None:
             params["limit"] = str(limit)
         if hydrate is not None:
             params["hydrate"] = self._bool_param(hydrate)
+        if exclude_edge_types:
+            params["exclude_edge_types"] = ",".join(exclude_edge_types)
+        if exclude_ids:
+            params["exclude_ids"] = ",".join(exclude_ids)
         response = self._request("GET", "/nearby", params=params)
         data = response.json()
         return [NodeView.model_validate(item) for item in data]
@@ -195,6 +215,8 @@ class EloClient:
         lon: Optional[float] = None,
         radius_km: Optional[float] = None,
         hydrate: Optional[bool] = None,
+        exclude_edge_types: Optional[Iterable[str]] = None,
+        exclude_ids: Optional[Iterable[str]] = None,
     ) -> List[Recommendation]:
         params: Dict[str, str] = {"start": start, "type": node_type}
         if num_key:
@@ -215,6 +237,10 @@ class EloClient:
             params["radius_km"] = str(radius_km)
         if hydrate is not None:
             params["hydrate"] = self._bool_param(hydrate)
+        if exclude_edge_types:
+            params["exclude_edge_types"] = ",".join(exclude_edge_types)
+        if exclude_ids:
+            params["exclude_ids"] = ",".join(exclude_ids)
         response = self._request("GET", "/recommendations", params=params)
         data = response.json()
         return [Recommendation.model_validate(item) for item in data]

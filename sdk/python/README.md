@@ -11,6 +11,8 @@ client.upsert_schema("edge", ["type", "weight", "status"])
 client.create_node("user:123", data={"type": "user"})
 client.create_node("team:42", data={"type": "team", "rating": "520"})
 client.create_edge("user:123", "team:42", data={"type": "owner"})
+client.block("user:123", "user:456")
+client.unblock("user:123", "user:456")
 
 client.update_node("user:123", rating="850", status="active")
 client.update_edge("user:123", "team:42", role="captain")
@@ -29,8 +31,11 @@ recs = client.recommendations(
     max_value=900,
     limit=5,
     hydrate=False,
+    exclude_edge_types=["block", "mute"],
 )
 print(recs)
+
+# Observacao: edges com type="block" sao espelhadas automaticamente (A->B tambem cria B->A).
 
 # Filtrar por raio (usa GeoPoint no start ou lat/lon direto)
 client.update_node("user:123", location="-23.5505,-46.6333")
@@ -41,6 +46,15 @@ nearby = client.recommendations(
     hydrate=True,
 )
 print(nearby)
+
+# Nearby por geohash com exclusoes
+nearby_geo = client.nearby(
+    node_type="team",
+    geo_hash_prefix="6gkzwg",
+    start="user:123",
+    exclude_edge_types=["block", "mute"],
+)
+print(nearby_geo)
 ```
 
 ## Uso com ORM (classes customizadas)
